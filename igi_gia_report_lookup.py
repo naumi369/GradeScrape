@@ -353,45 +353,95 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
             return result
 
         text_upper = text.upper()
+        # Normalize common PDF extraction noise
+        text_upper = text_upper.replace("×", "X").replace("–", "-").replace("—", "-")
 
         # ---------- Shape ----------
-        shape_match = re.search(
-            r"(ROUND|PRINCESS|CUSHION|OVAL|PEAR|MARQUISE|EMERALD|RADIANT|HEART|ASSCHER)"
-            r"(?:\s+(?:BRILLIANT|CUT|MODIFIED|MODIFIED BRILLIANT))?",
-            text_upper
-        )
-        if shape_match:
-            result["Shape"] = shape_match.group(0).title().strip()
+        shape_patterns = [
+            r"SHAPE\s*(?:AND\s*CUTTING\s*STYLE)?\s*[:\s]*([A-Z\s\-]+?)(?:\n|MEASUREMENTS|WEIGHT|CARAT)",
+            r"(ROUND BRILLIANT|PRINCESS CUT|CUSHION MODIFIED BRILLIANT|CUSHION BRILLIANT|"
+            r"OVAL BRILLIANT|PEAR BRILLIANT|MARQUISE BRILLIANT|EMERALD CUT|"
+            r"SQUARE EMERALD CUT|RADIANT CUT|HEART BRILLIANT|ASSCHER CUT)",
+            r"\b(ROUND|PRINCESS|CUSHION|OVAL|PEAR|MARQUISE|EMERALD|RADIANT|HEART|ASSCHER)\b",
+        ]
+        for pat in shape_patterns:
+            m = re.search(pat, text_upper)
+            if m:
+                shape = m.group(1).strip()
+                shape = re.sub(r'\s+', ' ', shape)
+                if 3 < len(shape) < 45:
+                    result["Shape"] = shape.title()
+                    break
 
         # ---------- Measurements ----------
-        meas = re.search(r"([\d\.]+\s*[xX×]\s*[\d\.]+\s*[xX×]\s*[\d\.]+\s*mm)", text_upper, re.IGNORECASE)
-        if not meas:
-            meas = re.search(r"([\d\.]+\s*-\s*[\d\.]+\s*[xX×]\s*[\d\.]+\s*mm)", text_upper, re.IGNORECASE)
-        if meas:
-            result["MM Size"] = meas.group(1).replace("X", "×").replace("x", "×")
+        meas_patterns = [
+            r"MEASUREMENTS?\s*[:\s]*([\d\.\s\-X]+mm)",
+            r"([\d\.]+\s*[xX]\s*[\d\.]+\s*[xX]\s*[\d\.]+\s*mm)",
+            r"([\d\.]+\s*-\s*[\d\.]+\s*[xX]\s*[\d\.]+\s*mm)",
+            r"([\d\.]+\s*[xX]\s*[\d\.]+\s*[xX]\s*[\d\.]+)",
+        ]
+        for pat in meas_patterns:
+            m = re.search(pat, text_upper)
+            if m:
+                size = m.group(1).strip().replace("X", "×")
+                if "mm" not in size.lower():
+                    size += " mm"
+                result["MM Size"] = size
+                break
 
-        # ---------- Carat ----------
-        carat = re.search(r"([\d\.]+)\s*CARAT", text_upper)
-        if carat:
-            result["Weight"] = f"{carat.group(1)} ct"
+        # ---------- Carat Weight ----------
+        weight_patterns = [
+            r"(?:CARAT\s*WEIGHT|WEIGHT)\s*[:\s]*([\d\.]+)\s*(?:CARAT|CT)?",
+            r"([\d\.]+)\s*CARAT",
+            r"([\d\.]+)\s*CT\b",
+        ]
+        for pat in weight_patterns:
+            m = re.search(pat, text_upper)
+            if m:
+                result["Weight"] = f"{m.group(1)} ct"
+                break
 
-        # ---------- Color ----------
-        color = re.search(r"COLOR\s*(?:GRADE)?\s*[:\s]*([D-Z])\b", text_upper)
-        if color:
-            result["Color"] = color.group(1)
+        # ---------- Color (stronger patterns for GIA) ----------
+        color_patterns = [
+            r"COLOR\s*(?:GRADE)?\s*[:\s]*([D-Z])\b",
+            r"COLOR\s*GRADE\s*([D-Z])",
+            r"\bCOLOR\s+([D-Z])\b",
+            r"([D-Z])\s*(?:COLOR|CLR)\b",
+            r"GRADE\s*([D-Z])\s*(?:CLARITY|VS|VVS|SI|IF)",
+        ]
+        for pat in color_patterns:
+            m = re.search(pat, text_upper)
+            if m:
+                result["Color"] = m.group(1)
+                break
 
-        # ---------- Clarity ----------
-        clarity = re.search(r"CLARITY\s*(?:GRADE)?\s*[:\s]*((?:FL|IF|VVS[12]|VS[12]|SI[12]|I[123]))", text_upper)
-        if clarity:
-            result["Clarity"] = clarity.group(1)
+        # ---------- Clarity (stronger patterns for GIA) ----------
+        clarity_patterns = [
+            r"CLARITY\s*(?:GRADE)?\s*[:\s]*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
+            r"CLARITY\s*GRADE\s*((?:FL|IF|VVS[12]|VS[12]|SI[12]|I[123]))",
+            r"\b((?:FL|IF|VVS[12]|VS[12]|SI[12]|I[123]))\s*(?:CLARITY|CLR)?\b",
+            r"CLARITY\s*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
+        ]
+        for pat in clarity_patterns:
+            m = re.search(pat, text_upper)
+            if m:
+                clar = re.sub(r'\s+', '', m.group(1)).upper()
+                result["Clarity"] = clar
+                break
+
+        # Process is not applicable for natural GIA diamonds
+        result["Process"] = "—"
 
         filled = sum(1 for k in ["Shape", "MM Size", "Weight", "Color", "Clarity"] if result[k])
-        if filled >= 2:
+        if filled >= 3:
             result["Status"] = "Success (Token PDF)"
-            result["Notes"] = f"Extracted from GIA PDF token • {filled}/5 fields"
-        else:
+            result["Notes"] = f"Extracted from GIA PDF • {filled}/5 fields"
+        elif filled >= 1:
             result["Status"] = "Partial"
-            result["Notes"] = f"PDF downloaded but only {filled}/5 fields found"
+            result["Notes"] = f"PDF downloaded • {filled}/5 fields found"
+        else:
+            result["Status"] = "Parse Error"
+            result["Notes"] = "PDF downloaded but key fields not found"
 
     except Exception as e:
         result["Status"] = "Error"
