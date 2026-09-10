@@ -353,95 +353,63 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
             return result
 
         text_upper = text.upper()
-        # Normalize common PDF extraction noise
-        text_upper = text_upper.replace("×", "X").replace("–", "-").replace("—", "-")
+
+        # GIA reports use many dots between label and value, e.g.:
+        # Shape and Cutting Style ............................................ Round Brilliant
+        # Carat Weight ........................................................................ 0.50 carat
+        # Color Grade ........................................................................................ G
+        # Clarity Grade ......................................................................................SI1
+
+        # ---------- Report Number ----------
+        if result.get("Report Number") == "Unknown":
+            m = re.search(r"GIA REPORT NUMBER[\s.]+(\d{8,13})", text_upper)
+            if m:
+                result["Report Number"] = m.group(1)
 
         # ---------- Shape ----------
-        shape_patterns = [
-            r"SHAPE\s*(?:AND\s*CUTTING\s*STYLE)?\s*[:\s]*([A-Z\s\-]+?)(?:\n|MEASUREMENTS|WEIGHT|CARAT)",
-            r"(ROUND BRILLIANT|PRINCESS CUT|CUSHION MODIFIED BRILLIANT|CUSHION BRILLIANT|"
-            r"OVAL BRILLIANT|PEAR BRILLIANT|MARQUISE BRILLIANT|EMERALD CUT|"
-            r"SQUARE EMERALD CUT|RADIANT CUT|HEART BRILLIANT|ASSCHER CUT)",
-            r"\b(ROUND|PRINCESS|CUSHION|OVAL|PEAR|MARQUISE|EMERALD|RADIANT|HEART|ASSCHER)\b",
-        ]
-        for pat in shape_patterns:
-            m = re.search(pat, text_upper)
-            if m:
-                shape = m.group(1).strip()
-                shape = re.sub(r'\s+', ' ', shape)
-                if 3 < len(shape) < 45:
-                    result["Shape"] = shape.title()
-                    break
+        m = re.search(r"SHAPE AND CUTTING STYLE[\s.]+([A-Z][A-Z\s\-]+?)(?:\n|MEASUREMENTS|$)", text_upper)
+        if not m:
+            m = re.search(r"(ROUND BRILLIANT|PRINCESS CUT|CUSHION MODIFIED BRILLIANT|CUSHION BRILLIANT|"
+                          r"OVAL BRILLIANT|PEAR BRILLIANT|MARQUISE BRILLIANT|EMERALD CUT|"
+                          r"SQUARE EMERALD CUT|RADIANT CUT|HEART BRILLIANT|ASSCHER CUT)", text_upper)
+        if m:
+            result["Shape"] = re.sub(r'\s+', ' ', m.group(1)).strip().title()
 
         # ---------- Measurements ----------
-        meas_patterns = [
-            r"MEASUREMENTS?\s*[:\s]*([\d\.\s\-X]+mm)",
-            r"([\d\.]+\s*[xX]\s*[\d\.]+\s*[xX]\s*[\d\.]+\s*mm)",
-            r"([\d\.]+\s*-\s*[\d\.]+\s*[xX]\s*[\d\.]+\s*mm)",
-            r"([\d\.]+\s*[xX]\s*[\d\.]+\s*[xX]\s*[\d\.]+)",
-        ]
-        for pat in meas_patterns:
-            m = re.search(pat, text_upper)
-            if m:
-                size = m.group(1).strip().replace("X", "×")
-                if "mm" not in size.lower():
-                    size += " mm"
-                result["MM Size"] = size
-                break
+        m = re.search(r"MEASUREMENTS[\s.]+([\d\.\s\-X]+)\s*MM", text_upper)
+        if m:
+            size = m.group(1).strip().replace("X", "×")
+            size = re.sub(r'\s+', ' ', size) + " mm"
+            result["MM Size"] = size
 
         # ---------- Carat Weight ----------
-        weight_patterns = [
-            r"(?:CARAT\s*WEIGHT|WEIGHT)\s*[:\s]*([\d\.]+)\s*(?:CARAT|CT)?",
-            r"([\d\.]+)\s*CARAT",
-            r"([\d\.]+)\s*CT\b",
-        ]
-        for pat in weight_patterns:
-            m = re.search(pat, text_upper)
-            if m:
-                result["Weight"] = f"{m.group(1)} ct"
-                break
+        m = re.search(r"CARAT WEIGHT[\s.]+([\d\.]+)\s*CARAT", text_upper)
+        if m:
+            result["Weight"] = f"{m.group(1)} ct"
 
-        # ---------- Color (stronger patterns for GIA) ----------
-        color_patterns = [
-            r"COLOR\s*(?:GRADE)?\s*[:\s]*([D-Z])\b",
-            r"COLOR\s*GRADE\s*([D-Z])",
-            r"\bCOLOR\s+([D-Z])\b",
-            r"([D-Z])\s*(?:COLOR|CLR)\b",
-            r"GRADE\s*([D-Z])\s*(?:CLARITY|VS|VVS|SI|IF)",
-        ]
-        for pat in color_patterns:
-            m = re.search(pat, text_upper)
-            if m:
-                result["Color"] = m.group(1)
-                break
+        # ---------- Color ----------
+        m = re.search(r"COLOR GRADE[\s.]+([D-Z])\b", text_upper)
+        if m:
+            result["Color"] = m.group(1)
 
-        # ---------- Clarity (stronger patterns for GIA) ----------
-        clarity_patterns = [
-            r"CLARITY\s*(?:GRADE)?\s*[:\s]*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
-            r"CLARITY\s*GRADE\s*((?:FL|IF|VVS[12]|VS[12]|SI[12]|I[123]))",
-            r"\b((?:FL|IF|VVS[12]|VS[12]|SI[12]|I[123]))\s*(?:CLARITY|CLR)?\b",
-            r"CLARITY\s*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
-        ]
-        for pat in clarity_patterns:
-            m = re.search(pat, text_upper)
-            if m:
-                clar = re.sub(r'\s+', '', m.group(1)).upper()
-                result["Clarity"] = clar
-                break
+        # ---------- Clarity ----------
+        m = re.search(r"CLARITY GRADE[\s.]+((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))", text_upper)
+        if m:
+            result["Clarity"] = re.sub(r'\s+', '', m.group(1)).upper()
 
-        # Process is not applicable for natural GIA diamonds
         result["Process"] = "—"
 
         filled = sum(1 for k in ["Shape", "MM Size", "Weight", "Color", "Clarity"] if result[k])
-        if filled >= 3:
+        if filled >= 4:
             result["Status"] = "Success (Token PDF)"
             result["Notes"] = f"Extracted from GIA PDF • {filled}/5 fields"
-        elif filled >= 1:
+        elif filled >= 2:
             result["Status"] = "Partial"
             result["Notes"] = f"PDF downloaded • {filled}/5 fields found"
         else:
             result["Status"] = "Parse Error"
             result["Notes"] = "PDF downloaded but key fields not found"
+
 
     except Exception as e:
         result["Status"] = "Error"
