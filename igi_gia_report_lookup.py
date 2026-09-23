@@ -132,26 +132,47 @@ def extract_text_from_pdf(content: bytes) -> str:
         return text
 
 
+def empty_inventory_row(cert: str = "", lab: str = "") -> Dict[str, Any]:
+    """Full inventory schema matching the Excel template."""
+    return {
+        "Certificate Number": cert,
+        "DESCRIPTION": "LABORATORY GROWN DIAMOND" if lab == "IGI" else ("NATURAL DIAMOND" if lab == "GIA" else ""),
+        "SHAPE AND CUT": None,
+        "CARAT WEIGHT": None,
+        "COLOR GRADE": None,
+        "CLARITY GRADE": None,
+        "MEASUREMENTS": None,
+        "CUT": None,
+        "POLISH": None,
+        "SYMMETRY": None,
+        "FLUORESCENCE": None,
+        "Process": None,
+        "FGI Item Number": "",
+        "Date Shipped from India": "",
+        "For stock or Customer": "",
+        "Production Order #, if for stock": "",
+        "Current Location/Status": "",
+        "Price Per Carat": "",
+        "Price For stone": "",
+        "CERTIFICATE LINK": "",
+        "Comment": "",
+        "Lab": lab,
+        "Status": "Error",
+        "Notes": "",
+    }
+
+
 def fetch_igi_report(report_no: str) -> Dict[str, Any]:
     """
     Fetch live IGI Laboratory Grown Diamond report from official PDF.
-    Uses multiple extraction + parsing fallbacks for maximum reliability.
+    Returns full inventory-format row.
     """
     number_only = re.sub(r'^LG', '', report_no, flags=re.IGNORECASE)
+    cert = report_no if report_no.upper().startswith("LG") else f"LG{number_only}"
     pdf_url = f"https://pdf.igi.org/FDR{number_only}.pdf"
 
-    result = {
-        "Report Number": report_no if report_no.upper().startswith("LG") else f"LG{number_only}",
-        "Lab": "IGI",
-        "Shape": None,
-        "MM Size": None,
-        "Weight": None,
-        "Color": None,
-        "Clarity": None,
-        "Process": None,
-        "Status": "Error",
-        "Notes": ""
-    }
+    result = empty_inventory_row(cert, "IGI")
+    result["CERTIFICATE LINK"] = pdf_url
 
     try:
         headers = {
@@ -176,88 +197,86 @@ def fetch_igi_report(report_no: str) -> Dict[str, Any]:
             return result
 
         text_upper = text.upper()
-        # Normalize common OCR / extraction noise
         text_upper = text_upper.replace("×", "X").replace("–", "-").replace("—", "-")
 
-        # ---------- SHAPE ----------
+        # Shape
         shape_patterns = [
             r"SHAPE AND CUTTING STYLE\s*([A-Z0-9\s\-]+?)(?:\n|MEASUREMENTS|GRADING)",
             r"SHAPE AND CUTTING STYLE\s*([^\n]{5,60})",
             r"(ROUND BRILLIANT|PRINCESS CUT|CUSHION MODIFIED BRILLIANT|CUSHION BRILLIANT|"
             r"OVAL BRILLIANT|PEAR BRILLIANT|MARQUISE BRILLIANT|EMERALD CUT|"
             r"SQUARE EMERALD CUT|RADIANT CUT|HEART BRILLIANT|ASSCHER CUT|"
-            r"TRIANGLE BRILLIANT|TRILLIANT)",
+            r"CUT CORNERED RECTANGULAR|TRIANGLE BRILLIANT|TRILLIANT)",
         ]
         for pat in shape_patterns:
             m = re.search(pat, text_upper)
             if m:
-                shape = m.group(1).strip()
-                shape = re.sub(r'\s+', ' ', shape)
-                # Remove trailing garbage
+                shape = re.sub(r'\s+', ' ', m.group(1)).strip()
                 shape = re.split(r'\s{2,}|\d|MM|CARAT', shape)[0].strip()
                 if 4 < len(shape) < 50:
-                    result["Shape"] = shape.title()
+                    result["SHAPE AND CUT"] = shape.title()
                     break
 
-        # ---------- MEASUREMENTS (MM Size) ----------
+        # Measurements
         meas_patterns = [
             r"MEASUREMENTS?\s*([\d\.\-\sX]+?\s*MM)",
             r"([\d\.]+\s*[-–]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+\s*MM)",
             r"([\d\.]+\s*[Xx×]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+\s*MM)",
-            r"([\d\.]+\s*[-–]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+)",
         ]
         for pat in meas_patterns:
             m = re.search(pat, text_upper)
             if m:
-                size = m.group(1).strip()
-                size = size.replace("X", "×").replace("x", "×")
+                size = m.group(1).strip().replace("X", "×").replace("x", "×")
                 size = re.sub(r'\s+', ' ', size)
                 if "MM" not in size.upper():
                     size += " mm"
                 else:
                     size = size.replace("MM", "mm")
-                result["MM Size"] = size
+                result["MEASUREMENTS"] = size
                 break
 
-        # ---------- CARAT WEIGHT ----------
-        weight_patterns = [
-            r"(\d+\.\d{2})\s*CARATS?",
-            r"CARAT WEIGHT\s*(\d+\.\d{2})",
-            r"(\d+\.\d{2})\s*CT\b",
-        ]
-        for pat in weight_patterns:
+        # Carat
+        for pat in [r"(\d+\.\d{2})\s*CARATS?", r"CARAT WEIGHT\s*(\d+\.\d{2})", r"(\d+\.\d{2})\s*CT\b"]:
             m = re.search(pat, text_upper)
             if m:
-                result["Weight"] = f"{m.group(1)} ct"
+                result["CARAT WEIGHT"] = f"{m.group(1)} ct"
                 break
 
-        # ---------- COLOR ----------
-        color_patterns = [
-            r"COLOR GRADE\s*([D-Z])\b",
-            r"COLOR\s*GRADE\s*[:\s]*([D-Z])\b",
-            r"\b([D-Z])\s+(?:VS|VVS|SI|IF|FL|IDEAL)",
-            r"\bCOLOR\s+([D-Z])\b",
-        ]
-        for pat in color_patterns:
+        # Color
+        for pat in [r"COLOR GRADE\s*([D-Z])\b", r"COLOR\s*GRADE\s*[:\s]*([D-Z])\b"]:
             m = re.search(pat, text_upper)
             if m:
-                result["Color"] = m.group(1)
+                result["COLOR GRADE"] = m.group(1)
                 break
 
-        # ---------- CLARITY ----------
-        clarity_patterns = [
+        # Clarity
+        for pat in [
             r"CLARITY GRADE\s*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
             r"CLARITY\s*GRADE\s*[:\s]*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
-            r"\b(VVS\s*[12]|VS\s*[12]|SI\s*[12]|IF|FL)\b",
-        ]
-        for pat in clarity_patterns:
+        ]:
             m = re.search(pat, text_upper)
             if m:
-                clar = m.group(1).replace(" ", "").upper()
-                result["Clarity"] = clar
+                result["CLARITY GRADE"] = re.sub(r'\s+', '', m.group(1)).upper()
                 break
 
-        # ---------- PROCESS (CVD / HPHT) ----------
+        # Cut / Polish / Symmetry / Fluorescence
+        m = re.search(r"CUT GRADE\s*(IDEAL|EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+        if m:
+            result["CUT"] = m.group(1).title()
+
+        m = re.search(r"POLISH\s*(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+        if m:
+            result["POLISH"] = m.group(1).title()
+
+        m = re.search(r"SYMMETRY\s*(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+        if m:
+            result["SYMMETRY"] = m.group(1).title()
+
+        m = re.search(r"FLUORESCENCE\s*(NONE|FAINT|MEDIUM|STRONG|VERY STRONG)", text_upper)
+        if m:
+            result["FLUORESCENCE"] = m.group(1).title()
+
+        # Process
         if re.search(r"CHEMICAL\s+VAPOR\s+DEPOSITION|\bCVD\b", text_upper):
             result["Process"] = "CVD"
         elif re.search(r"HIGH\s+PRESSURE\s+HIGH\s+TEMPERATURE|\bHPHT\b", text_upper):
@@ -265,14 +284,13 @@ def fetch_igi_report(report_no: str) -> Dict[str, Any]:
         else:
             result["Process"] = "Unknown"
 
-        # Final status
-        filled = sum(1 for k in ["Shape", "MM Size", "Weight", "Color", "Clarity"] if result[k])
+        filled = sum(1 for k in ["SHAPE AND CUT", "MEASUREMENTS", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"] if result[k])
         if filled >= 3:
             result["Status"] = "Success"
             result["Notes"] = f"Fetched live • {filled}/5 core fields"
         elif filled >= 1:
             result["Status"] = "Partial"
-            result["Notes"] = f"Partial extraction • {filled}/5 fields found"
+            result["Notes"] = f"Partial extraction • {filled}/5 fields"
         else:
             result["Status"] = "Parse Error"
             result["Notes"] = "Text extracted but key fields not found"
@@ -288,19 +306,11 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
     """
     Download a GIA report PDF using a special token link
     (https://pdf.gia.edu/?ReportNumber=HASH) and extract grading data.
+    Returns full inventory-format row.
     """
-    result = {
-        "Report Number": "Unknown",
-        "Lab": "GIA",
-        "Shape": None,
-        "MM Size": None,
-        "Weight": None,
-        "Color": None,
-        "Clarity": None,
-        "Process": "—",
-        "Status": "Error",
-        "Notes": ""
-    }
+    result = empty_inventory_row("Unknown", "GIA")
+    result["Process"] = "—"
+    result["CERTIFICATE LINK"] = token_url
 
     try:
         headers = {
@@ -319,7 +329,7 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
             # Try to extract report number from URL if possible
             m = re.search(r"/(\d{8,13})\.pdf", token_url)
             if m:
-                result["Report Number"] = m.group(1)
+                result["Certificate Number"] = m.group(1)
         else:
             # Look for the S3 redirect URL inside the HTML/JS
             html = resp.text
@@ -336,7 +346,7 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
             # Extract report number from the S3 path if possible
             num_match = re.search(r"/(\d{8,13})\.pdf", pdf_url)
             if num_match:
-                result["Report Number"] = num_match.group(1)
+                result["Certificate Number"] = num_match.group(1)
 
             # Step 2: Download the actual PDF
             pdf_resp = requests.get(pdf_url, headers=headers, timeout=30)
@@ -361,10 +371,10 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
         # Clarity Grade ......................................................................................SI1
 
         # ---------- Report Number ----------
-        if result.get("Report Number") == "Unknown":
+        if result.get("Certificate Number") in ("Unknown", "", None):
             m = re.search(r"GIA REPORT NUMBER[\s.]+(\d{8,13})", text_upper)
             if m:
-                result["Report Number"] = m.group(1)
+                result["Certificate Number"] = m.group(1)
 
         # ---------- Shape ----------
         m = re.search(r"SHAPE AND CUTTING STYLE[\s.]+([A-Z][A-Z\s\-]+?)(?:\n|MEASUREMENTS|$)", text_upper)
@@ -373,33 +383,48 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
                           r"OVAL BRILLIANT|PEAR BRILLIANT|MARQUISE BRILLIANT|EMERALD CUT|"
                           r"SQUARE EMERALD CUT|RADIANT CUT|HEART BRILLIANT|ASSCHER CUT)", text_upper)
         if m:
-            result["Shape"] = re.sub(r'\s+', ' ', m.group(1)).strip().title()
+            result["SHAPE AND CUT"] = re.sub(r'\s+', ' ', m.group(1)).strip().title()
 
         # ---------- Measurements ----------
         m = re.search(r"MEASUREMENTS[\s.]+([\d\.\s\-X]+)\s*MM", text_upper)
         if m:
             size = m.group(1).strip().replace("X", "×")
             size = re.sub(r'\s+', ' ', size) + " mm"
-            result["MM Size"] = size
+            result["MEASUREMENTS"] = size
 
         # ---------- Carat Weight ----------
         m = re.search(r"CARAT WEIGHT[\s.]+([\d\.]+)\s*CARAT", text_upper)
         if m:
-            result["Weight"] = f"{m.group(1)} ct"
+            result["CARAT WEIGHT"] = f"{m.group(1)} ct"
 
         # ---------- Color ----------
         m = re.search(r"COLOR GRADE[\s.]+([D-Z])\b", text_upper)
         if m:
-            result["Color"] = m.group(1)
+            result["COLOR GRADE"] = m.group(1)
 
         # ---------- Clarity ----------
         m = re.search(r"CLARITY GRADE[\s.]+((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))", text_upper)
         if m:
-            result["Clarity"] = re.sub(r'\s+', '', m.group(1)).upper()
+            result["CLARITY GRADE"] = re.sub(r'\s+', '', m.group(1)).upper()
+
+        # Cut / Polish / Symmetry / Fluorescence (GIA)
+        m = re.search(r"CUT GRADE[\s.]+(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+        if m:
+            result["CUT"] = m.group(1).title()
+        m = re.search(r"POLISH[\s.]+(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+        if m:
+            result["POLISH"] = m.group(1).title()
+        m = re.search(r"SYMMETRY[\s.]+(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+        if m:
+            result["SYMMETRY"] = m.group(1).title()
+        m = re.search(r"FLUORESCENCE[\s.]+(NONE|FAINT|MEDIUM|STRONG|VERY STRONG)", text_upper)
+        if m:
+            result["FLUORESCENCE"] = m.group(1).title()
 
         result["Process"] = "—"
+        result["DESCRIPTION"] = "NATURAL DIAMOND"
 
-        filled = sum(1 for k in ["Shape", "MM Size", "Weight", "Color", "Clarity"] if result[k])
+        filled = sum(1 for k in ["SHAPE AND CUT", "MEASUREMENTS", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"] if result[k])
         if filled >= 4:
             result["Status"] = "Success (Token PDF)"
             result["Notes"] = f"Extracted from GIA PDF • {filled}/5 fields"
@@ -424,18 +449,12 @@ def fetch_gia_info(report_no: str, try_playwright: bool = False) -> Dict[str, An
     By default only returns a clean link.
     If try_playwright=True, attempts browser extraction (often fails due to GIA protection).
     """
-    result = {
-        "Report Number": report_no,
-        "Lab": "GIA",
-        "Shape": None,
-        "MM Size": None,
-        "Weight": None,
-        "Color": None,
-        "Clarity": None,
-        "Process": "—",
-        "Status": "Link Ready",
-        "Notes": "See clickable links below the table"
-    }
+    result = empty_inventory_row(report_no, "GIA")
+    result["Process"] = "—"
+    result["DESCRIPTION"] = "NATURAL DIAMOND"
+    result["CERTIFICATE LINK"] = f"https://www.gia.edu/report-check?reportno={report_no}"
+    result["Status"] = "Link Ready"
+    result["Notes"] = "See clickable links below the table"
 
     if not try_playwright or not HAS_PLAYWRIGHT:
         if try_playwright and not HAS_PLAYWRIGHT:
@@ -637,18 +656,9 @@ if fetch_btn and report_text.strip():
         elif is_gia(value):
             data = fetch_gia_info(value, try_playwright=use_playwright)
         else:
-            data = {
-                "Report Number": value,
-                "Lab": "Unknown",
-                "Shape": None,
-                "MM Size": None,
-                "Weight": None,
-                "Color": None,
-                "Clarity": None,
-                "Process": None,
-                "Status": "Unknown Format",
-                "Notes": "Could not determine if IGI or GIA"
-            }
+            data = empty_inventory_row(value, "Unknown")
+            data["Status"] = "Unknown Format"
+            data["Notes"] = "Could not determine if IGI or GIA"
         results.append(data)
         time.sleep(0.5)
 
@@ -657,63 +667,80 @@ if fetch_btn and report_text.strip():
 
     df = pd.DataFrame(results)
 
-    # Reorder columns
-    cols = ["Report Number", "Lab", "Shape", "MM Size", "Weight", "Color", "Clarity", "Process", "Status", "Notes"]
-    df = df[[c for c in cols if c in df.columns]]
+    # Full inventory column order (matches Excel template)
+    inventory_cols = [
+        "Certificate Number", "DESCRIPTION", "SHAPE AND CUT", "CARAT WEIGHT",
+        "COLOR GRADE", "CLARITY GRADE", "MEASUREMENTS", "CUT", "POLISH",
+        "SYMMETRY", "FLUORESCENCE", "Process",
+        "FGI Item Number", "Date Shipped from India", "For stock or Customer",
+        "Production Order #, if for stock", "Current Location/Status",
+        "Price Per Carat", "Price For stone", "CERTIFICATE LINK", "Comment",
+        "Lab", "Status", "Notes"
+    ]
+    df = df[[c for c in inventory_cols if c in df.columns]]
 
     st.success(f"Completed • {len(df)} reports processed")
 
     # Summary metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total", len(df))
-    m2.metric("IGI", len(df[df["Lab"] == "IGI"]))
-    m3.metric("GIA", len(df[df["Lab"] == "GIA"]))
-    m4.metric("Success / Link", len(df[df["Status"].isin(["Success", "Link Ready"])]))
+    m2.metric("IGI", len(df[df["Lab"] == "IGI"]) if "Lab" in df.columns else 0)
+    m3.metric("GIA", len(df[df["Lab"] == "GIA"]) if "Lab" in df.columns else 0)
+    success_statuses = ["Success", "Success (Token PDF)", "Link Ready"]
+    m4.metric("Success / Link", len(df[df["Status"].isin(success_statuses)]) if "Status" in df.columns else 0)
+
+    st.caption("Yellow-highlighted columns in the downloaded Excel are for you to fill in (FGI Item #, dates, prices, etc.).")
 
     st.dataframe(
         df,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Notes": st.column_config.TextColumn("Notes", width="large")
+            "CERTIFICATE LINK": st.column_config.LinkColumn("CERTIFICATE LINK"),
+            "Notes": st.column_config.TextColumn("Notes", width="medium"),
+            "Comment": st.column_config.TextColumn("Comment", width="medium"),
         }
     )
 
     # Download buttons
-    st.subheader("Download Results")
+    st.subheader("Download Inventory")
     c1, c2 = st.columns(2)
 
     with c1:
-        # Excel
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Reports")
+            # Drop helper cols for clean inventory export
+            export_df = df.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in df.columns], errors="ignore")
+            export_df.to_excel(writer, index=False, sheet_name="Inventory")
         st.download_button(
-            label="📥 Download Excel (.xlsx)",
+            label="📥 Download Inventory Excel (.xlsx)",
             data=buffer.getvalue(),
-            file_name="IGI_GIA_Reports.xlsx",
+            file_name="IGI_GIA_Inventory.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
 
     with c2:
-        csv = df.to_csv(index=False).encode("utf-8")
+        export_df = df.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in df.columns], errors="ignore")
+        csv = export_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="📥 Download CSV",
+            label="📥 Download Inventory CSV",
             data=csv,
-            file_name="IGI_GIA_Reports.csv",
+            file_name="IGI_GIA_Inventory.csv",
             mime="text/csv",
             use_container_width=True
         )
 
-    # GIA links section – clickable links
-    gia_rows = df[df["Lab"] == "GIA"]
-    if not gia_rows.empty:
-        st.subheader("🔗 GIA Official Report Check Links")
-        st.caption("Click any link below to open the official GIA Report Check page in a new tab.")
-        for _, row in gia_rows.iterrows():
-            url = f"https://www.gia.edu/report-check?reportno={row['Report Number']}"
-            st.markdown(f"**{row['Report Number']}** → [Open GIA Report Check]({url})")
+    # GIA links section
+    if "Lab" in df.columns:
+        gia_rows = df[df["Lab"] == "GIA"]
+        if not gia_rows.empty:
+            st.subheader("🔗 GIA Official Report Check Links")
+            st.caption("Click any link below to open the official GIA Report Check page in a new tab.")
+            for _, row in gia_rows.iterrows():
+                cert = row.get("Certificate Number", "")
+                link = row.get("CERTIFICATE LINK") or f"https://www.gia.edu/report-check?reportno={cert}"
+                st.markdown(f"**{cert}** → [Open GIA Report Check]({link})")
 
 else:
     st.markdown(
