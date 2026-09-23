@@ -456,7 +456,8 @@ def fetch_igi_report(report_no: str) -> Dict[str, Any]:
 
         if resp.status_code == 404:
             result["Status"] = "Not Found"
-            result["Notes"] = "PDF not available on IGI website"
+            result["Notes"] = "PDF not public yet – open Verify on igi.org and fill grades in Edit tab"
+            result["CERTIFICATE LINK"] = f"https://www.igi.org/Verify-Your-Report/?r={cert}"
             return result
         if resp.status_code != 200:
             result["Status"] = f"HTTP {resp.status_code}"
@@ -931,11 +932,15 @@ LG834619611"""
         progress.empty()
         status_text.empty()
 
-        # Save successful / partial rows to DB
-        to_save = [r for r in results if r.get("Status") not in ("Unknown Format", "Error", "Not Found")]
+        # Save rows to DB (including Not Found so user can fill grades later)
+        to_save = [r for r in results if r.get("Status") not in ("Unknown Format", "Error")]
         if to_save:
             upsert_rows(to_save)
-            st.success(f"Saved **{len(to_save)}** certificate(s) to inventory database.")
+            not_found = sum(1 for r in to_save if r.get("Status") == "Not Found")
+            msg = f"Saved **{len(to_save)}** certificate(s) to inventory database."
+            if not_found:
+                msg += f" ({not_found} without public PDF – fill grades in Edit tab)"
+            st.success(msg)
 
         df_new = pd.DataFrame(results)
         inv_cols = [c for c in INVENTORY_COLUMNS if c in df_new.columns]
