@@ -981,12 +981,114 @@ with tab_all:
         c3.metric("IGI", len(df_all[df_all["Lab"] == "IGI"]))
         c4.metric("GIA", len(df_all[df_all["Lab"] == "GIA"]))
 
-    # Filters
+    # ---- Smart search bar ----
+    st.markdown("**🔍 Smart search** — e.g. `2 CT Oval VS2` · `E color pear` · `CVD 3ct` · `LG831`")
+    search_q = st.text_input(
+        "Search inventory",
+        value="",
+        placeholder="Type shape, carat, color, clarity, process, certificate #…",
+        label_visibility="collapsed",
+        key="inventory_search",
+    )
+
     f1, f2 = st.columns(2)
     with f1:
-        filter_lab = st.selectbox("Filter by Lab", ["All", "IGI", "GIA", "Unknown"])
+        filter_lab = st.selectbox("Filter by Lab", ["All", "IGI", "GIA", "Unknown"], key="lab_filter")
     with f2:
-        filter_today = st.checkbox("Show only added today", value=False)
+        filter_today = st.checkbox("Show only added today", value=False, key="today_filter")
+
+    def smart_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
+        """Filter inventory using natural-ish phrases like '2 CT Oval VS2'."""
+        if df.empty or not query or not query.strip():
+            return df
+
+        q = query.strip().upper()
+        mask = pd.Series([True] * len(df), index=df.index)
+
+        # Certificate number fragment (LG… or pure digits)
+        cert_hits = re.findall(r"\bLG?\d{6,}\b", q)
+        for c in cert_hits:
+            col = df["Certificate Number"].astype(str).str.upper()
+            mask &= col.str.contains(c, na=False)
+
+        # Carat weight: 2 CT, 2CT, 2.5 carat, 2.03
+        carat_m = re.search(r"(\d+\.?\d*)\s*(?:CT|CARAT|CTS|CARATS)\b", q)
+        if not carat_m:
+            # bare number near CT-like intent is handled only with unit to avoid false hits
+            carat_m = None
+        if carat_m and "CARAT WEIGHT" in df.columns:
+            target = float(carat_m.group(1))
+            def _near_carat(val):
+                try:
+                    s = str(val).upper().replace("CT", "").replace("CARAT", "").strip()
+                    num = float(re.search(r"[\d.]+", s).group())
+                    return abs(num - target) < 0.15  # tolerance
+                except Exception:
+                    return False
+            mask &= df["CARAT WEIGHT"].apply(_near_carat)
+
+        # Shape keywords
+        shapes = [
+            "ROUND", "OVAL", "PEAR", "MARQUISE", "PRINCESS", "CUSHION",
+            "EMERALD", "RADIANT", "HEART", "ASSCHER", "RECTANGULAR", "SQUARE",
+            "BRILLIANT", "CUT CORNERED",
+        ]
+        for shape in shapes:
+            if shape in q and "SHAPE AND CUT" in df.columns:
+                mask &= df["SHAPE AND CUT"].astype(str).str.upper().str.contains(shape, na=False)
+
+        # Color grade (single letter D–Z, avoid matching inside words)
+        color_m = re.search(r"\b([D-Z])\s*(?:COLOR|COLOUR)?\b", q)
+        if color_m and "COLOR GRADE" in df.columns:
+            # Prefer explicit "E COLOR" or lone grade if clarity not the same letter issue
+            letter = color_m.group(1)
+            # Don't treat VS/SI fragments as color
+            if letter not in ("I",):  # I can be clarity I1; still allow if "I COLOR"
+                if "COLOR" in q or re.search(rf"\b{letter}\b", q):
+                    mask &= df["COLOR GRADE"].astype(str).str.upper() == letter
+
+        # Explicit color patterns: "color E", "E color"
+        color_m2 = re.search(r"(?:COLOR|COLOUR)\s*([D-Z])\b|\b([D-Z])\s*(?:COLOR|COLOUR)\b", q)
+        if color_m2 and "COLOR GRADE" in df.columns:
+            letter = color_m2.group(1) or color_m2.group(2)
+            mask &= df["COLOR GRADE"].astype(str).str.upper() == letter
+
+        # Clarity
+        clar_m = re.search(r"\b(FL|IF|VVS\s*1|VVS\s*2|VVS1|VVS2|VS\s*1|VS\s*2|VS1|VS2|SI\s*1|SI\s*2|SI1|SI2|I\s*1|I\s*2|I\s*3|I1|I2|I3)\b", q)
+        if clar_m and "CLARITY GRADE" in df.columns:
+            clar = re.sub(r"\s+", "", clar_m.group(1)).upper()
+            mask &= df["CLARITY GRADE"].astype(str).str.upper().str.replace(" ", "") == clar
+
+        # Process
+        if "CVD" in q and "Process" in df.columns:
+            mask &= df["Process"].astype(str).str.upper().str.contains("CVD", na=False)
+        if "HPHT" in q and "Process" in df.columns:
+            mask &= df["Process"].astype(str).str.upper().str.contains("HPHT", na=False)
+
+        # Free-text fallback: if nothing structural matched heavily, also match any column
+        # Always apply token search on remaining words for certificate / location etc.
+        tokens = re.findall(r"[A-Z0-9]{2,}", q)
+        skip = {"CT", "CARAT", "CARATS", "CTS", "SHOW", "ME", "IN", "THE", "WITH", "AND", "COLOR", "COLOUR", "CLARITY", "SHAPE", "CUT"}
+        for tok in tokens:
+            if tok in skip or re.match(r"^\d+\.?\d*$", tok):
+                continue
+            if tok in shapes or tok in ("CVD", "HPHT"):
+                continue
+            if re.match(r"^(FL|IF|VVS|VS|SI|I)[123]?$", tok):
+                continue
+            if len(tok) == 1 and tok.isalpha():
+                continue
+            # Search across main text columns
+            cols = [c for c in ["Certificate Number", "SHAPE AND CUT", "FGI Item Number",
+                                "Current Location/Status", "For stock or Customer",
+                                "Comment", "DESCRIPTION"] if c in df.columns]
+            if cols:
+                sub = pd.Series([False] * len(df), index=df.index)
+                for c in cols:
+                    sub |= df[c].astype(str).str.upper().str.contains(tok, na=False)
+                mask &= sub
+
+        return df[mask]
 
     view = df_all.copy()
     if filter_lab != "All" and not view.empty and "Lab" in view.columns:
@@ -994,7 +1096,10 @@ with tab_all:
     if filter_today and not view.empty and "date_added" in view.columns:
         today_str = date.today().isoformat()
         view = view[view["date_added"].astype(str).str.startswith(today_str)]
+    if search_q.strip() and not view.empty:
+        view = smart_filter(view, search_q)
 
+    st.caption(f"Showing **{len(view)}** of **{len(df_all)}** certificates")
     st.dataframe(view, use_container_width=True, hide_index=True)
 
     if not view.empty:
@@ -1003,9 +1108,9 @@ with tab_all:
             export = view.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns], errors="ignore")
             export.to_excel(writer, index=False, sheet_name="Inventory")
         st.download_button(
-            "📥 Download full inventory (Excel)",
+            "📥 Download filtered inventory (Excel)",
             data=buffer.getvalue(),
-            file_name="Full_Inventory.xlsx",
+            file_name="Filtered_Inventory.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
