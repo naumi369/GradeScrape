@@ -998,33 +998,36 @@ with tab_all:
         filter_today = st.checkbox("Show only added today", value=False, key="today_filter")
 
     def smart_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
-        """Filter inventory using natural-ish phrases like '2 CT Oval VS2'."""
+        """Filter inventory using natural-ish phrases like '2 CT Oval VS2' or 'emerald 2ct'."""
         if df.empty or not query or not query.strip():
             return df
 
         q = query.strip().upper()
         mask = pd.Series([True] * len(df), index=df.index)
 
-        # Certificate number fragment (LG… or pure digits)
+        # Certificate number fragment
         cert_hits = re.findall(r"\bLG?\d{6,}\b", q)
         for c in cert_hits:
             col = df["Certificate Number"].astype(str).str.upper()
             mask &= col.str.contains(c, na=False)
 
-        # Carat weight: 2 CT, 2CT, 2.5 carat, 2.03
+        # Carat: "2 CT", "2CT", "2.5 carat", "2ct"
         carat_m = re.search(r"(\d+\.?\d*)\s*(?:CT|CARAT|CTS|CARATS)\b", q)
-        if not carat_m:
-            # bare number near CT-like intent is handled only with unit to avoid false hits
-            carat_m = None
         if carat_m and "CARAT WEIGHT" in df.columns:
             target = float(carat_m.group(1))
+            # Whole number (e.g. 2ct) → match 2.00–2.99; decimal → tight tolerance
+            is_whole = abs(target - round(target)) < 1e-9
+
             def _near_carat(val):
                 try:
-                    s = str(val).upper().replace("CT", "").replace("CARAT", "").strip()
+                    s = str(val).upper()
                     num = float(re.search(r"[\d.]+", s).group())
-                    return abs(num - target) < 0.15  # tolerance
+                    if is_whole:
+                        return target <= num < target + 1.0
+                    return abs(num - target) <= 0.12
                 except Exception:
                     return False
+
             mask &= df["CARAT WEIGHT"].apply(_near_carat)
 
         # Shape keywords
@@ -1034,58 +1037,62 @@ with tab_all:
             "BRILLIANT", "CUT CORNERED",
         ]
         for shape in shapes:
-            if shape in q and "SHAPE AND CUT" in df.columns:
+            if re.search(rf"\b{shape}\b", q) and "SHAPE AND CUT" in df.columns:
                 mask &= df["SHAPE AND CUT"].astype(str).str.upper().str.contains(shape, na=False)
 
-        # Color grade (single letter D–Z, avoid matching inside words)
-        color_m = re.search(r"\b([D-Z])\s*(?:COLOR|COLOUR)?\b", q)
-        if color_m and "COLOR GRADE" in df.columns:
-            # Prefer explicit "E COLOR" or lone grade if clarity not the same letter issue
-            letter = color_m.group(1)
-            # Don't treat VS/SI fragments as color
-            if letter not in ("I",):  # I can be clarity I1; still allow if "I COLOR"
-                if "COLOR" in q or re.search(rf"\b{letter}\b", q):
-                    mask &= df["COLOR GRADE"].astype(str).str.upper() == letter
-
-        # Explicit color patterns: "color E", "E color"
+        # Color: "E color", "color E", or explicit "COLOR E"
         color_m2 = re.search(r"(?:COLOR|COLOUR)\s*([D-Z])\b|\b([D-Z])\s*(?:COLOR|COLOUR)\b", q)
         if color_m2 and "COLOR GRADE" in df.columns:
             letter = color_m2.group(1) or color_m2.group(2)
             mask &= df["COLOR GRADE"].astype(str).str.upper() == letter
 
         # Clarity
-        clar_m = re.search(r"\b(FL|IF|VVS\s*1|VVS\s*2|VVS1|VVS2|VS\s*1|VS\s*2|VS1|VS2|SI\s*1|SI\s*2|SI1|SI2|I\s*1|I\s*2|I\s*3|I1|I2|I3)\b", q)
+        clar_m = re.search(
+            r"\b(FL|IF|VVS\s*1|VVS\s*2|VVS1|VVS2|VS\s*1|VS\s*2|VS1|VS2|"
+            r"SI\s*1|SI\s*2|SI1|SI2|I\s*1|I\s*2|I\s*3|I1|I2|I3)\b",
+            q,
+        )
         if clar_m and "CLARITY GRADE" in df.columns:
             clar = re.sub(r"\s+", "", clar_m.group(1)).upper()
-            mask &= df["CLARITY GRADE"].astype(str).str.upper().str.replace(" ", "") == clar
+            mask &= df["CLARITY GRADE"].astype(str).str.upper().str.replace(" ", "", regex=False) == clar
 
         # Process
-        if "CVD" in q and "Process" in df.columns:
+        if re.search(r"\bCVD\b", q) and "Process" in df.columns:
             mask &= df["Process"].astype(str).str.upper().str.contains("CVD", na=False)
-        if "HPHT" in q and "Process" in df.columns:
+        if re.search(r"\bHPHT\b", q) and "Process" in df.columns:
             mask &= df["Process"].astype(str).str.upper().str.contains("HPHT", na=False)
 
-        # Free-text fallback: if nothing structural matched heavily, also match any column
-        # Always apply token search on remaining words for certificate / location etc.
-        tokens = re.findall(r"[A-Z0-9]{2,}", q)
-        skip = {"CT", "CARAT", "CARATS", "CTS", "SHOW", "ME", "IN", "THE", "WITH", "AND", "COLOR", "COLOUR", "CLARITY", "SHAPE", "CUT"}
+        # Free-text tokens (location, FGI item, comments) — skip already-handled tokens
+        tokens = re.findall(r"[A-Z0-9.]{2,}", q)
+        skip = {
+            "CT", "CARAT", "CARATS", "CTS", "SHOW", "ME", "IN", "THE", "WITH", "AND",
+            "COLOR", "COLOUR", "CLARITY", "SHAPE", "CUT", "GRADE",
+        }
         for tok in tokens:
-            if tok in skip or re.match(r"^\d+\.?\d*$", tok):
+            if tok in skip:
+                continue
+            # Skip pure numbers and carat-like tokens (2CT, 2.5CT)
+            if re.match(r"^\d+\.?\d*$", tok):
+                continue
+            if re.match(r"^\d+\.?\d*(CT|CARAT|CTS|CARATS)$", tok):
                 continue
             if tok in shapes or tok in ("CVD", "HPHT"):
                 continue
-            if re.match(r"^(FL|IF|VVS|VS|SI|I)[123]?$", tok):
+            if re.match(r"^(FL|IF|VVS[12]?|VS[12]?|SI[12]?|I[123]?)$", tok):
                 continue
             if len(tok) == 1 and tok.isalpha():
                 continue
-            # Search across main text columns
-            cols = [c for c in ["Certificate Number", "SHAPE AND CUT", "FGI Item Number",
-                                "Current Location/Status", "For stock or Customer",
-                                "Comment", "DESCRIPTION"] if c in df.columns]
+            cols = [
+                c for c in [
+                    "Certificate Number", "SHAPE AND CUT", "FGI Item Number",
+                    "Current Location/Status", "For stock or Customer",
+                    "Comment", "DESCRIPTION",
+                ] if c in df.columns
+            ]
             if cols:
                 sub = pd.Series([False] * len(df), index=df.index)
                 for c in cols:
-                    sub |= df[c].astype(str).str.upper().str.contains(tok, na=False)
+                    sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
                 mask &= sub
 
         return df[mask]
