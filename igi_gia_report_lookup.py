@@ -1,19 +1,16 @@
 """
-IGI + GIA Diamond Report Live Lookup - Streamlit App
+IGI + GIA Diamond Inventory Manager - Streamlit App
 ----------------------------------------------------
 Features:
-- Paste multiple report numbers (one per line)
-- Auto-detects IGI (LG...) vs GIA (numeric)
-- Live fetches IGI reports from official PDF
-- Robust multi-method PDF text extraction + many parsing fallbacks
-- GIA: tries Playwright browser automation to extract data, falls back to link
-- Displays results in interactive table
-- Download as Excel / CSV
-- Clean, professional UI
+- Live fetch IGI / GIA reports
+- Full inventory column format
+- SQLite database – keeps growing as you add certificates
+- Tabs: Add New | All Inventory | Edit Editable Fields
+- Track how many certificates added today
+- Edit FGI Item #, prices, location, etc. and save
 
 How to run:
-    pip install streamlit pandas openpyxl requests pdfplumber pypdf playwright
-    playwright install chromium
+    pip install streamlit pandas openpyxl requests pdfplumber pypdf
     streamlit run igi_gia_report_lookup.py
 """
 
@@ -22,7 +19,10 @@ import pandas as pd
 import requests
 import re
 import io
-from typing import Optional, Dict, Any
+import sqlite3
+import os
+from datetime import datetime, date
+from typing import Optional, Dict, Any, List
 import time
 
 # Optional: pdfplumber for better PDF text extraction
@@ -40,11 +40,284 @@ except ImportError:
     HAS_PLAYWRIGHT = False
 
 st.set_page_config(
-    page_title="IGI + GIA Report Lookup",
+    page_title="IGI + GIA Inventory Manager",
     page_icon="💎",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# -------------------------------------------------
+# Database (SQLite – persists across sessions)
+# -------------------------------------------------
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory.db")
+
+INVENTORY_COLUMNS = [
+    "Certificate Number", "DESCRIPTION", "SHAPE AND CUT", "CARAT WEIGHT",
+    "COLOR GRADE", "CLARITY GRADE", "MEASUREMENTS", "CUT", "POLISH",
+    "SYMMETRY", "FLUORESCENCE", "Process",
+    "FGI Item Number", "Date Shipped from India", "For stock or Customer",
+    "Production Order #, if for stock", "Current Location/Status",
+    "Price Per Carat", "Price For stone", "CERTIFICATE LINK", "Comment",
+    "Lab", "Status", "Notes", "date_added", "last_updated"
+]
+
+EDITABLE_COLUMNS = [
+    "FGI Item Number", "Date Shipped from India", "For stock or Customer",
+    "Production Order #, if for stock", "Current Location/Status",
+    "Price Per Carat", "Price For stone", "Comment"
+]
+
+
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db():
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            certificate_number TEXT PRIMARY KEY,
+            description TEXT,
+            shape_and_cut TEXT,
+            carat_weight TEXT,
+            color_grade TEXT,
+            clarity_grade TEXT,
+            measurements TEXT,
+            cut_grade TEXT,
+            polish TEXT,
+            symmetry TEXT,
+            fluorescence TEXT,
+            process TEXT,
+            fgi_item_number TEXT,
+            date_shipped_from_india TEXT,
+            for_stock_or_customer TEXT,
+            production_order TEXT,
+            current_location_status TEXT,
+            price_per_carat TEXT,
+            price_for_stone TEXT,
+            certificate_link TEXT,
+            comment TEXT,
+            lab TEXT,
+            status TEXT,
+            notes TEXT,
+            date_added TEXT,
+            last_updated TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def row_to_db_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "certificate_number": row.get("Certificate Number") or "",
+        "description": row.get("DESCRIPTION") or "",
+        "shape_and_cut": row.get("SHAPE AND CUT") or "",
+        "carat_weight": row.get("CARAT WEIGHT") or "",
+        "color_grade": row.get("COLOR GRADE") or "",
+        "clarity_grade": row.get("CLARITY GRADE") or "",
+        "measurements": row.get("MEASUREMENTS") or "",
+        "cut_grade": row.get("CUT") or "",
+        "polish": row.get("POLISH") or "",
+        "symmetry": row.get("SYMMETRY") or "",
+        "fluorescence": row.get("FLUORESCENCE") or "",
+        "process": row.get("Process") or "",
+        "fgi_item_number": row.get("FGI Item Number") or "",
+        "date_shipped_from_india": row.get("Date Shipped from India") or "",
+        "for_stock_or_customer": row.get("For stock or Customer") or "",
+        "production_order": row.get("Production Order #, if for stock") or "",
+        "current_location_status": row.get("Current Location/Status") or "",
+        "price_per_carat": row.get("Price Per Carat") or "",
+        "price_for_stone": row.get("Price For stone") or "",
+        "certificate_link": row.get("CERTIFICATE LINK") or "",
+        "comment": row.get("Comment") or "",
+        "lab": row.get("Lab") or "",
+        "status": row.get("Status") or "",
+        "notes": row.get("Notes") or "",
+        "date_added": row.get("date_added") or now,
+        "last_updated": now,
+    }
+
+
+def db_dict_to_row(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "Certificate Number": d.get("certificate_number"),
+        "DESCRIPTION": d.get("description"),
+        "SHAPE AND CUT": d.get("shape_and_cut"),
+        "CARAT WEIGHT": d.get("carat_weight"),
+        "COLOR GRADE": d.get("color_grade"),
+        "CLARITY GRADE": d.get("clarity_grade"),
+        "MEASUREMENTS": d.get("measurements"),
+        "CUT": d.get("cut_grade"),
+        "POLISH": d.get("polish"),
+        "SYMMETRY": d.get("symmetry"),
+        "FLUORESCENCE": d.get("fluorescence"),
+        "Process": d.get("process"),
+        "FGI Item Number": d.get("fgi_item_number"),
+        "Date Shipped from India": d.get("date_shipped_from_india"),
+        "For stock or Customer": d.get("for_stock_or_customer"),
+        "Production Order #, if for stock": d.get("production_order"),
+        "Current Location/Status": d.get("current_location_status"),
+        "Price Per Carat": d.get("price_per_carat"),
+        "Price For stone": d.get("price_for_stone"),
+        "CERTIFICATE LINK": d.get("certificate_link"),
+        "Comment": d.get("comment"),
+        "Lab": d.get("lab"),
+        "Status": d.get("status"),
+        "Notes": d.get("notes"),
+        "date_added": d.get("date_added"),
+        "last_updated": d.get("last_updated"),
+    }
+
+
+def upsert_rows(rows: List[Dict[str, Any]]):
+    """Insert or update rows. Preserves existing editable fields on update."""
+    conn = get_conn()
+    cur = conn.cursor()
+    for row in rows:
+        cert = (row.get("Certificate Number") or "").strip()
+        if not cert:
+            continue
+        existing = cur.execute(
+            "SELECT fgi_item_number, date_shipped_from_india, for_stock_or_customer, "
+            "production_order, current_location_status, price_per_carat, price_for_stone, "
+            "comment, date_added FROM inventory WHERE certificate_number = ?",
+            (cert,)
+        ).fetchone()
+
+        d = row_to_db_dict(row)
+        if existing:
+            # Keep user-editable fields that already have values
+            (fgi, shipped, stock, po, loc, ppc, pfs, comment, date_added) = existing
+            if fgi:
+                d["fgi_item_number"] = fgi
+            if shipped:
+                d["date_shipped_from_india"] = shipped
+            if stock:
+                d["for_stock_or_customer"] = stock
+            if po:
+                d["production_order"] = po
+            if loc:
+                d["current_location_status"] = loc
+            if ppc:
+                d["price_per_carat"] = ppc
+            if pfs:
+                d["price_for_stone"] = pfs
+            if comment:
+                d["comment"] = comment
+            d["date_added"] = date_added  # keep original add date
+
+        cur.execute("""
+            INSERT INTO inventory (
+                certificate_number, description, shape_and_cut, carat_weight, color_grade,
+                clarity_grade, measurements, cut_grade, polish, symmetry, fluorescence,
+                process, fgi_item_number, date_shipped_from_india, for_stock_or_customer,
+                production_order, current_location_status, price_per_carat, price_for_stone,
+                certificate_link, comment, lab, status, notes, date_added, last_updated
+            ) VALUES (
+                :certificate_number, :description, :shape_and_cut, :carat_weight, :color_grade,
+                :clarity_grade, :measurements, :cut_grade, :polish, :symmetry, :fluorescence,
+                :process, :fgi_item_number, :date_shipped_from_india, :for_stock_or_customer,
+                :production_order, :current_location_status, :price_per_carat, :price_for_stone,
+                :certificate_link, :comment, :lab, :status, :notes, :date_added, :last_updated
+            )
+            ON CONFLICT(certificate_number) DO UPDATE SET
+                description=excluded.description,
+                shape_and_cut=excluded.shape_and_cut,
+                carat_weight=excluded.carat_weight,
+                color_grade=excluded.color_grade,
+                clarity_grade=excluded.clarity_grade,
+                measurements=excluded.measurements,
+                cut_grade=excluded.cut_grade,
+                polish=excluded.polish,
+                symmetry=excluded.symmetry,
+                fluorescence=excluded.fluorescence,
+                process=excluded.process,
+                fgi_item_number=excluded.fgi_item_number,
+                date_shipped_from_india=excluded.date_shipped_from_india,
+                for_stock_or_customer=excluded.for_stock_or_customer,
+                production_order=excluded.production_order,
+                current_location_status=excluded.current_location_status,
+                price_per_carat=excluded.price_per_carat,
+                price_for_stone=excluded.price_for_stone,
+                certificate_link=excluded.certificate_link,
+                comment=excluded.comment,
+                lab=excluded.lab,
+                status=excluded.status,
+                notes=excluded.notes,
+                last_updated=excluded.last_updated
+        """, d)
+    conn.commit()
+    conn.close()
+
+
+def load_all_inventory() -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT * FROM inventory ORDER BY date_added DESC", conn)
+    conn.close()
+    if df.empty:
+        return pd.DataFrame(columns=INVENTORY_COLUMNS)
+    rows = [db_dict_to_row(r) for r in df.to_dict(orient="records")]
+    return pd.DataFrame(rows)
+
+
+def update_editable_fields(df_edit: pd.DataFrame):
+    """Save only the editable columns for existing certificates."""
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    for _, row in df_edit.iterrows():
+        cert = str(row.get("Certificate Number", "")).strip()
+        if not cert:
+            continue
+        cur.execute("""
+            UPDATE inventory SET
+                fgi_item_number = ?,
+                date_shipped_from_india = ?,
+                for_stock_or_customer = ?,
+                production_order = ?,
+                current_location_status = ?,
+                price_per_carat = ?,
+                price_for_stone = ?,
+                comment = ?,
+                last_updated = ?
+            WHERE certificate_number = ?
+        """, (
+            str(row.get("FGI Item Number") or ""),
+            str(row.get("Date Shipped from India") or ""),
+            str(row.get("For stock or Customer") or ""),
+            str(row.get("Production Order #, if for stock") or ""),
+            str(row.get("Current Location/Status") or ""),
+            str(row.get("Price Per Carat") or ""),
+            str(row.get("Price For stone") or ""),
+            str(row.get("Comment") or ""),
+            now,
+            cert,
+        ))
+    conn.commit()
+    conn.close()
+
+
+def count_added_today() -> int:
+    today = date.today().isoformat()
+    conn = get_conn()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM inventory WHERE date_added LIKE ?",
+        (f"{today}%",)
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def total_count() -> int:
+    conn = get_conn()
+    n = conn.execute("SELECT COUNT(*) FROM inventory").fetchone()[0]
+    conn.close()
+    return n
+
+
+init_db()
 
 # -------------------------------------------------
 # Helper functions
@@ -559,205 +832,213 @@ def fetch_gia_info(report_no: str, try_playwright: bool = False) -> Dict[str, An
 # Streamlit UI
 # -------------------------------------------------
 
-st.title("💎 IGI + GIA Diamond Report Live Lookup")
-st.markdown(
-    """
-    Paste **IGI report numbers**, **GIA report numbers**, or **GIA PDF token links** (one per line).  
-    The app will auto-detect the type and extract data where possible.
-    """
-)
+st.title("💎 IGI + GIA Inventory Manager")
+st.caption("Live report lookup + persistent inventory database")
 
+# Sidebar
 with st.sidebar:
-    st.header("About")
-    st.markdown(
-        """
-        **IGI Support**  
-        Full live lookup from official PDF reports  
-        (Shape, Measurements, Weight, Color, Clarity, Process)
-
-        **GIA Support**  
-        Official Report Check links (reliable & fast).  
-        Optional experimental browser extraction (often blocked by GIA).
-        """
-    )
-
+    st.header("📊 Inventory Stats")
+    st.metric("Total certificates", total_count())
+    st.metric("Added today", count_added_today())
+    st.divider()
+    st.header("Settings")
     use_playwright = st.toggle(
         "Try Playwright for GIA (experimental)",
         value=False,
-        help="Attempts automatic extraction. Usually times out or gets blocked. Keep OFF for best experience."
+        help="Usually blocked by GIA. Keep OFF."
     )
-
     st.markdown(
         """
         **Tips**
-        - IGI numbers usually start with `LG`
-        - GIA numbers: `GIA# 123...` or just the number
-        - GIA PDF tokens: paste the full `https://pdf.gia.edu/?ReportNumber=...` link
-        - You can mix everything in the same list
+        - IGI: `LG831649004`
+        - GIA number or `GIA# 123...`
+        - GIA token: full `pdf.gia.edu` link
+        - Editable fields are saved when you click **Save**
         """
     )
     st.divider()
-    st.caption("Built for diamond professionals • Live data from official sources")
+    st.caption("SQLite database: inventory.db")
 
-# Input area
-default_example = """LG833638417
-LG727519767
-GIA# 6555540885
-https://pdf.gia.edu/?ReportNumber=A0B42B94F6E0CCFEC856F5971E9D171A"""
-report_text = st.text_area(
-    "Report numbers or GIA PDF token links (one per line)",
-    value=default_example,
-    height=180,
-    help="You can mix IGI numbers, GIA numbers, and special GIA PDF token links"
-)
+# ---------- Tabs ----------
+tab_add, tab_all, tab_edit = st.tabs([
+    "➕ Add New Certificates",
+    "📋 All Inventory",
+    "✏️ Edit Editable Fields"
+])
 
-col1, col2, col3 = st.columns([1, 1, 2])
-with col1:
-    fetch_btn = st.button("🔍 Fetch Reports", type="primary", use_container_width=True)
-with col2:
-    clear_btn = st.button("Clear", use_container_width=True)
-
-if clear_btn:
-    st.rerun()
-
-if fetch_btn and report_text.strip():
-    raw_lines = [line.strip() for line in report_text.strip().splitlines() if line.strip()]
-
-    # Keep original lines so we can detect token URLs
-    seen = set()
-    items_to_process = []  # list of (type, value)
-    for line in raw_lines:
-        if is_gia_token_url(line):
-            key = line
-            if key not in seen:
-                seen.add(key)
-                items_to_process.append(("token", line))
-        else:
-            cleaned = clean_report_number(line)
-            if cleaned and cleaned not in seen:
-                seen.add(cleaned)
-                items_to_process.append(("number", cleaned))
-
-    st.info(f"Processing **{len(items_to_process)}** unique item(s)...")
-
-    progress = st.progress(0)
-    status_text = st.empty()
-    results = []
-
-    for i, (item_type, value) in enumerate(items_to_process):
-        display = value if len(value) < 60 else value[:50] + "..."
-        status_text.text(f"Looking up {display} ({i+1}/{len(items_to_process)})...")
-        progress.progress((i + 1) / len(items_to_process))
-
-        if item_type == "token":
-            data = fetch_gia_from_token(value)
-        elif is_igi(value):
-            data = fetch_igi_report(value)
-        elif is_gia(value):
-            data = fetch_gia_info(value, try_playwright=use_playwright)
-        else:
-            data = empty_inventory_row(value, "Unknown")
-            data["Status"] = "Unknown Format"
-            data["Notes"] = "Could not determine if IGI or GIA"
-        results.append(data)
-        time.sleep(0.5)
-
-    progress.empty()
-    status_text.empty()
-
-    df = pd.DataFrame(results)
-
-    # Full inventory column order (matches Excel template)
-    inventory_cols = [
-        "Certificate Number", "DESCRIPTION", "SHAPE AND CUT", "CARAT WEIGHT",
-        "COLOR GRADE", "CLARITY GRADE", "MEASUREMENTS", "CUT", "POLISH",
-        "SYMMETRY", "FLUORESCENCE", "Process",
-        "FGI Item Number", "Date Shipped from India", "For stock or Customer",
-        "Production Order #, if for stock", "Current Location/Status",
-        "Price Per Carat", "Price For stone", "CERTIFICATE LINK", "Comment",
-        "Lab", "Status", "Notes"
-    ]
-    df = df[[c for c in inventory_cols if c in df.columns]]
-
-    st.success(f"Completed • {len(df)} reports processed")
-
-    # Summary metrics
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total", len(df))
-    m2.metric("IGI", len(df[df["Lab"] == "IGI"]) if "Lab" in df.columns else 0)
-    m3.metric("GIA", len(df[df["Lab"] == "GIA"]) if "Lab" in df.columns else 0)
-    success_statuses = ["Success", "Success (Token PDF)", "Link Ready"]
-    m4.metric("Success / Link", len(df[df["Status"].isin(success_statuses)]) if "Status" in df.columns else 0)
-
-    st.caption("Yellow-highlighted columns in the downloaded Excel are for you to fill in (FGI Item #, dates, prices, etc.).")
-
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "CERTIFICATE LINK": st.column_config.LinkColumn("CERTIFICATE LINK"),
-            "Notes": st.column_config.TextColumn("Notes", width="medium"),
-            "Comment": st.column_config.TextColumn("Comment", width="medium"),
-        }
+# =========================================================
+# TAB 1 – Add new certificates
+# =========================================================
+with tab_add:
+    st.subheader("Fetch & add certificates")
+    default_example = """LG831649004
+LG833663017
+LG834619611"""
+    report_text = st.text_area(
+        "Report numbers or GIA PDF token links (one per line)",
+        value=default_example,
+        height=160,
+        help="Mix IGI numbers, GIA numbers, and special GIA PDF token links"
     )
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        fetch_btn = st.button("🔍 Fetch & Save to Inventory", type="primary", use_container_width=True)
+    with col2:
+        clear_btn = st.button("Clear input", use_container_width=True)
 
-    # Download buttons
-    st.subheader("Download Inventory")
-    c1, c2 = st.columns(2)
+    if clear_btn:
+        st.rerun()
 
-    with c1:
+    if fetch_btn and report_text.strip():
+        raw_lines = [line.strip() for line in report_text.strip().splitlines() if line.strip()]
+        seen = set()
+        items_to_process = []
+        for line in raw_lines:
+            if is_gia_token_url(line):
+                key = line
+                if key not in seen:
+                    seen.add(key)
+                    items_to_process.append(("token", line))
+            else:
+                cleaned = clean_report_number(line)
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    items_to_process.append(("number", cleaned))
+
+        st.info(f"Processing **{len(items_to_process)}** unique item(s)...")
+        progress = st.progress(0)
+        status_text = st.empty()
+        results = []
+
+        for i, (item_type, value) in enumerate(items_to_process):
+            display = value if len(value) < 60 else value[:50] + "..."
+            status_text.text(f"Looking up {display} ({i+1}/{len(items_to_process)})...")
+            progress.progress((i + 1) / len(items_to_process))
+
+            if item_type == "token":
+                data = fetch_gia_from_token(value)
+            elif is_igi(value):
+                data = fetch_igi_report(value)
+            elif is_gia(value):
+                data = fetch_gia_info(value, try_playwright=use_playwright)
+            else:
+                data = empty_inventory_row(value, "Unknown")
+                data["Status"] = "Unknown Format"
+                data["Notes"] = "Could not determine if IGI or GIA"
+            results.append(data)
+            time.sleep(0.4)
+
+        progress.empty()
+        status_text.empty()
+
+        # Save successful / partial rows to DB
+        to_save = [r for r in results if r.get("Status") not in ("Unknown Format", "Error", "Not Found")]
+        if to_save:
+            upsert_rows(to_save)
+            st.success(f"Saved **{len(to_save)}** certificate(s) to inventory database.")
+
+        df_new = pd.DataFrame(results)
+        inv_cols = [c for c in INVENTORY_COLUMNS if c in df_new.columns]
+        df_new = df_new[inv_cols]
+
+        st.subheader("Just added / fetched (this session)")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Processed", len(df_new))
+        m2.metric("IGI", len(df_new[df_new["Lab"] == "IGI"]) if "Lab" in df_new.columns else 0)
+        m3.metric("GIA", len(df_new[df_new["Lab"] == "GIA"]) if "Lab" in df_new.columns else 0)
+        m4.metric("Added today (total)", count_added_today())
+
+        st.dataframe(df_new, use_container_width=True, hide_index=True)
+
+        # Download this batch
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            # Drop helper cols for clean inventory export
-            export_df = df.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in df.columns], errors="ignore")
-            export_df.to_excel(writer, index=False, sheet_name="Inventory")
+            export = df_new.drop(columns=[c for c in ["Lab", "Status", "Notes", "date_added", "last_updated"] if c in df_new.columns], errors="ignore")
+            export.to_excel(writer, index=False, sheet_name="Batch")
         st.download_button(
-            label="📥 Download Inventory Excel (.xlsx)",
+            "📥 Download this batch (Excel)",
             data=buffer.getvalue(),
-            file_name="IGI_GIA_Inventory.xlsx",
+            file_name=f"Batch_{date.today().isoformat()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
         )
 
-    with c2:
-        export_df = df.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in df.columns], errors="ignore")
-        csv = export_df.to_csv(index=False).encode("utf-8")
+# =========================================================
+# TAB 2 – All Inventory
+# =========================================================
+with tab_all:
+    st.subheader("Full inventory database")
+    df_all = load_all_inventory()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total in DB", len(df_all))
+    c2.metric("Added today", count_added_today())
+    if not df_all.empty and "Lab" in df_all.columns:
+        c3.metric("IGI", len(df_all[df_all["Lab"] == "IGI"]))
+        c4.metric("GIA", len(df_all[df_all["Lab"] == "GIA"]))
+
+    # Filters
+    f1, f2 = st.columns(2)
+    with f1:
+        filter_lab = st.selectbox("Filter by Lab", ["All", "IGI", "GIA", "Unknown"])
+    with f2:
+        filter_today = st.checkbox("Show only added today", value=False)
+
+    view = df_all.copy()
+    if filter_lab != "All" and not view.empty and "Lab" in view.columns:
+        view = view[view["Lab"] == filter_lab]
+    if filter_today and not view.empty and "date_added" in view.columns:
+        today_str = date.today().isoformat()
+        view = view[view["date_added"].astype(str).str.startswith(today_str)]
+
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+    if not view.empty:
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            export = view.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns], errors="ignore")
+            export.to_excel(writer, index=False, sheet_name="Inventory")
         st.download_button(
-            label="📥 Download Inventory CSV",
-            data=csv,
-            file_name="IGI_GIA_Inventory.csv",
-            mime="text/csv",
-            use_container_width=True
+            "📥 Download full inventory (Excel)",
+            data=buffer.getvalue(),
+            file_name="Full_Inventory.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    # GIA links section
-    if "Lab" in df.columns:
-        gia_rows = df[df["Lab"] == "GIA"]
-        if not gia_rows.empty:
-            st.subheader("🔗 GIA Official Report Check Links")
-            st.caption("Click any link below to open the official GIA Report Check page in a new tab.")
-            for _, row in gia_rows.iterrows():
-                cert = row.get("Certificate Number", "")
-                link = row.get("CERTIFICATE LINK") or f"https://www.gia.edu/report-check?reportno={cert}"
-                st.markdown(f"**{cert}** → [Open GIA Report Check]({link})")
+# =========================================================
+# TAB 3 – Edit editable fields
+# =========================================================
+with tab_edit:
+    st.subheader("Edit user fields (FGI Item #, prices, location, etc.)")
+    st.caption("Change the yellow columns, then click **Save changes**.")
 
-else:
-    st.markdown(
-        """
-        ### How it works
-        1. Paste your report numbers above (IGI or GIA)
-        2. Click **Fetch Reports**
-        3. View the live results table
-        4. Download Excel / CSV
+    df_all = load_all_inventory()
+    if df_all.empty:
+        st.info("No certificates in the database yet. Add some in the first tab.")
+    else:
+        # Show only key + editable columns for editing
+        edit_cols = ["Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"] + EDITABLE_COLUMNS
+        edit_cols = [c for c in edit_cols if c in df_all.columns]
+        df_edit = df_all[edit_cols].copy()
 
-        **Example IGI numbers** (from previous session):  
-        `LG833638417`, `LG727519767`, `LG793621413` …
+        edited = st.data_editor(
+            df_edit,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key="inventory_editor",
+            column_config={
+                "Certificate Number": st.column_config.TextColumn(disabled=True),
+                "SHAPE AND CUT": st.column_config.TextColumn(disabled=True),
+                "CARAT WEIGHT": st.column_config.TextColumn(disabled=True),
+                "COLOR GRADE": st.column_config.TextColumn(disabled=True),
+                "CLARITY GRADE": st.column_config.TextColumn(disabled=True),
+            }
+        )
 
-        **Example GIA number**:  
-        `2141438171`
-        """
-    )
+        if st.button("💾 Save changes to database", type="primary"):
+            update_editable_fields(edited)
+            st.success("Editable fields saved.")
+            st.rerun()
 
 st.divider()
-st.caption("Data sourced live from official IGI PDFs and GIA Report Check. Always verify critical results on the official websites.")
+st.caption("Data sourced live from official IGI PDFs and GIA Report Check. Inventory stored in local SQLite (inventory.db).")
