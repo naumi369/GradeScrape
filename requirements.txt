@@ -4,4 +4,5 @@ openpyxl
 requests
 pdfplumber
 pypdf
-playwright
+gspread
+google-auth
