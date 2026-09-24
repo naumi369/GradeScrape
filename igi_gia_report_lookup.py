@@ -484,10 +484,24 @@ def _load_gsheets_inventory() -> pd.DataFrame:
     return df[INVENTORY_COLUMNS]
 
 
+def _normalize_lab_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure Lab is filled from certificate number when blank."""
+    if df is None or df.empty:
+        return df
+    if "Lab" not in df.columns:
+        df["Lab"] = ""
+    if "Certificate Number" in df.columns:
+        df["Lab"] = [
+            infer_lab(cert, lab)
+            for cert, lab in zip(df["Certificate Number"], df["Lab"])
+        ]
+    return df
+
+
 def load_all_inventory() -> pd.DataFrame:
     if use_gsheets():
         try:
-            return _load_gsheets_inventory()
+            return _normalize_lab_column(_load_gsheets_inventory())
         except Exception as e:
             # Don't spam errors on quota – show once-friendly message
             msg = str(e)
@@ -503,7 +517,7 @@ def load_all_inventory() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=INVENTORY_COLUMNS)
     rows = [db_dict_to_row(r) for r in df.to_dict(orient="records")]
-    return pd.DataFrame(rows)
+    return _normalize_lab_column(pd.DataFrame(rows))
 
 
 def clear_inventory_cache():
@@ -739,7 +753,7 @@ def is_gia_token_url(text: str) -> bool:
 
 def is_igi(report_no: str) -> bool:
     """Detect IGI report (starts with LG)."""
-    return report_no.startswith("LG")
+    return str(report_no).strip().upper().startswith("LG")
 
 
 def is_gia(report_no: str) -> bool:
@@ -747,7 +761,21 @@ def is_gia(report_no: str) -> bool:
     Detect GIA-style report.
     Accepts pure numeric strings of reasonable length (typical GIA reports are 9–12 digits).
     """
-    return report_no.isdigit() and 8 <= len(report_no) <= 13
+    s = str(report_no).strip()
+    return s.isdigit() and 8 <= len(s) <= 13
+
+
+def infer_lab(cert: str, current_lab: str = "") -> str:
+    """Fill blank/unknown Lab from certificate number pattern."""
+    lab = (current_lab or "").strip()
+    if lab in ("IGI", "GIA"):
+        return lab
+    c = str(cert or "").strip()
+    if is_igi(c):
+        return "IGI"
+    if is_gia(c):
+        return "GIA"
+    return lab or "Unknown"
 
 
 def extract_text_from_pdf(content: bytes) -> str:
@@ -932,8 +960,9 @@ def save_video_urls(pairs: List[tuple], try_drive_backup: bool = True) -> List[D
         url = str(url).strip()
         if not cert or not url:
             continue
-        row = existing_map.get(cert) or empty_inventory_row(cert, "")
+        row = existing_map.get(cert) or empty_inventory_row(cert, infer_lab(cert))
         row["Certificate Number"] = cert
+        row["Lab"] = infer_lab(cert, row.get("Lab") or "")
         row["Video URL"] = url
         info = {"Certificate Number": cert, "Video URL": url, "backup": "skipped"}
 
