@@ -58,13 +58,15 @@ INVENTORY_COLUMNS = [
     "FGI Item Number", "Date Shipped from India", "For stock or Customer",
     "Production Order #, if for stock", "Current Location/Status",
     "Price Per Carat", "Price For stone", "CERTIFICATE LINK", "Comment",
+    "Video URL", "Video Backup Drive Link",
     "Lab", "Status", "Notes", "date_added", "last_updated"
 ]
 
 EDITABLE_COLUMNS = [
     "FGI Item Number", "Date Shipped from India", "For stock or Customer",
     "Production Order #, if for stock", "Current Location/Status",
-    "Price Per Carat", "Price For stone", "Comment"
+    "Price Per Carat", "Price For stone", "Comment",
+    "Video URL", "Video Backup Drive Link",
 ]
 
 SHEET_HEADERS = INVENTORY_COLUMNS  # same order written to Google Sheet
@@ -81,18 +83,35 @@ def _has_gsheets_secrets() -> bool:
         return False
 
 
+def _has_gdrive_folder() -> bool:
+    try:
+        return bool(st.secrets.get("drive", {}).get("folder_id"))
+    except Exception:
+        return False
+
+
 @st.cache_resource(show_spinner=False)
-def _get_gspread_client():
-    import gspread
+def _get_google_creds():
     from google.oauth2.service_account import Credentials
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(
+    return Credentials.from_service_account_info(
         dict(st.secrets["gcp_service_account"]), scopes=scopes
     )
-    return gspread.authorize(creds)
+
+
+@st.cache_resource(show_spinner=False)
+def _get_gspread_client():
+    import gspread
+    return gspread.authorize(_get_google_creds())
+
+
+@st.cache_resource(show_spinner=False)
+def _get_drive_service():
+    from googleapiclient.discovery import build
+    return build("drive", "v3", credentials=_get_google_creds(), cache_discovery=False)
 
 
 @st.cache_resource(show_spinner=False)
@@ -179,6 +198,8 @@ def row_to_db_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "price_for_stone": row.get("Price For stone") or "",
         "certificate_link": row.get("CERTIFICATE LINK") or "",
         "comment": row.get("Comment") or "",
+        "video_url": row.get("Video URL") or "",
+        "video_backup_drive_link": row.get("Video Backup Drive Link") or "",
         "lab": row.get("Lab") or "",
         "status": row.get("Status") or "",
         "notes": row.get("Notes") or "",
@@ -210,6 +231,8 @@ def db_dict_to_row(d: Dict[str, Any]) -> Dict[str, Any]:
         "Price For stone": d.get("price_for_stone"),
         "CERTIFICATE LINK": d.get("certificate_link"),
         "Comment": d.get("comment"),
+        "Video URL": d.get("video_url"),
+        "Video Backup Drive Link": d.get("video_backup_drive_link"),
         "Lab": d.get("lab"),
         "Status": d.get("status"),
         "Notes": d.get("notes"),
@@ -243,6 +266,8 @@ def _row_to_sheet_list(row: Dict[str, Any]) -> List[str]:
         "Price For stone": d["price_for_stone"],
         "CERTIFICATE LINK": d["certificate_link"],
         "Comment": d["comment"],
+        "Video URL": d["video_url"],
+        "Video Backup Drive Link": d["video_backup_drive_link"],
         "Lab": d["lab"],
         "Status": d["status"],
         "Notes": d["notes"],
@@ -660,10 +685,135 @@ def empty_inventory_row(cert: str = "", lab: str = "") -> Dict[str, Any]:
         "Price For stone": "",
         "CERTIFICATE LINK": "",
         "Comment": "",
+        "Video URL": "",
+        "Video Backup Drive Link": "",
         "Lab": lab,
         "Status": "Error",
         "Notes": "",
     }
+
+
+def probe_video_url(url: str) -> Dict[str, Any]:
+    """Check if URL is a direct downloadable video file."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, headers=headers, timeout=20, allow_redirects=True, stream=True)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        size = r.headers.get("Content-Length")
+        is_video = any(x in ct for x in ("video/", "mp4", "webm", "quicktime", "octet-stream"))
+        # Some S3 links return video/mp4
+        if "video/" in ct or url.lower().endswith((".mp4", ".webm", ".mov")):
+            is_video = True
+        return {
+            "ok": r.status_code == 200,
+            "status": r.status_code,
+            "content_type": ct,
+            "size": int(size) if size and size.isdigit() else None,
+            "is_direct_video": is_video and r.status_code == 200,
+            "final_url": r.url,
+        }
+    except Exception as e:
+        return {"ok": False, "status": 0, "content_type": "", "size": None, "is_direct_video": False, "error": str(e)}
+
+
+def download_and_upload_video_to_drive(cert: str, url: str) -> Dict[str, Any]:
+    """
+    Download a direct video file and upload to Google Drive folder.
+    Returns dict with drive_link or error.
+    """
+    if not _has_gdrive_folder():
+        return {"success": False, "error": "Drive folder_id not configured in secrets"}
+
+    probe = probe_video_url(url)
+    if not probe.get("is_direct_video"):
+        return {
+            "success": False,
+            "error": f"Not a direct video file (type={probe.get('content_type') or 'unknown'})",
+            "link_saved_only": True,
+        }
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, headers=headers, timeout=120, allow_redirects=True)
+        if r.status_code != 200:
+            return {"success": False, "error": f"Download HTTP {r.status_code}"}
+
+        # Pick extension
+        ct = (r.headers.get("Content-Type") or "").lower()
+        ext = ".mp4"
+        if "webm" in ct:
+            ext = ".webm"
+        elif "quicktime" in ct or "mov" in ct:
+            ext = ".mov"
+
+        filename = f"{cert}_video{ext}"
+        folder_id = st.secrets["drive"]["folder_id"]
+        service = _get_drive_service()
+
+        from googleapiclient.http import MediaIoBaseUpload
+        media = MediaIoBaseUpload(io.BytesIO(r.content), mimetype=ct or "video/mp4", resumable=True)
+        meta = {"name": filename, "parents": [folder_id]}
+        f = service.files().create(body=meta, media_body=media, fields="id,webViewLink,webContentLink").execute()
+
+        # Make readable by link (optional)
+        try:
+            service.permissions().create(
+                fileId=f["id"],
+                body={"type": "anyone", "role": "reader"},
+            ).execute()
+        except Exception:
+            pass
+
+        link = f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view"
+        return {"success": True, "drive_link": link, "file_id": f["id"], "filename": filename}
+    except Exception as e:
+        return {"success": False, "error": str(e)[:200]}
+
+
+def save_video_urls(pairs: List[tuple], try_drive_backup: bool = True) -> List[Dict[str, Any]]:
+    """
+    pairs: list of (certificate_number, video_url)
+    Updates inventory Video URL; optionally backs up direct videos to Drive.
+    """
+    results = []
+    existing = load_all_inventory()
+    existing_map = {}
+    if not existing.empty and "Certificate Number" in existing.columns:
+        for _, row in existing.iterrows():
+            existing_map[str(row["Certificate Number"]).strip()] = row.to_dict()
+
+    to_upsert = []
+    for cert, url in pairs:
+        cert = str(cert).strip()
+        url = str(url).strip()
+        if not cert or not url:
+            continue
+        row = existing_map.get(cert) or empty_inventory_row(cert, "")
+        row["Certificate Number"] = cert
+        row["Video URL"] = url
+        info = {"Certificate Number": cert, "Video URL": url, "backup": "skipped"}
+
+        if try_drive_backup and _has_gdrive_folder():
+            up = download_and_upload_video_to_drive(cert, url)
+            if up.get("success"):
+                row["Video Backup Drive Link"] = up["drive_link"]
+                info["backup"] = "uploaded"
+                info["Video Backup Drive Link"] = up["drive_link"]
+            elif up.get("link_saved_only"):
+                info["backup"] = "link only (not direct video)"
+                info["note"] = up.get("error", "")
+            else:
+                info["backup"] = "failed"
+                info["note"] = up.get("error", "")
+        else:
+            info["backup"] = "link saved (Drive not configured or disabled)"
+
+        to_upsert.append(row)
+        results.append(info)
+
+    if to_upsert:
+        upsert_rows(to_upsert)
+    return results
 
 
 def fetch_igi_report(report_no: str) -> Dict[str, Any]:
@@ -1102,10 +1252,11 @@ with st.sidebar:
         st.caption("Add Google Sheet secrets for permanent storage")
 
 # ---------- Tabs ----------
-tab_add, tab_all, tab_edit = st.tabs([
+tab_add, tab_all, tab_edit, tab_video = st.tabs([
     "➕ Add New Certificates",
     "📋 All Inventory",
-    "✏️ Edit Editable Fields"
+    "✏️ Edit Editable Fields",
+    "🎬 Video Links & Backup",
 ])
 
 # =========================================================
@@ -1397,6 +1548,78 @@ with tab_edit:
             update_editable_fields(edited)
             st.success("Editable fields saved.")
             st.rerun()
+
+# =========================================================
+# TAB 4 – Video links & Drive backup
+# =========================================================
+with tab_video:
+    st.subheader("Video links & Google Drive backup")
+    st.markdown(
+        """
+        Paste pairs: **certificate number** and **video URL** (tab or space separated, one per line).
+
+        - All links are saved to inventory (**Video URL** column)
+        - **Direct video files** (mp4/webm) are also uploaded to your Google Drive folder
+        - Vision360 / DNA / HTML viewers are saved as links only (not a single downloadable file)
+        """
+    )
+
+    if _has_gdrive_folder():
+        st.success("Google Drive folder configured – direct videos will be backed up.")
+    else:
+        st.warning("Drive folder not configured yet – links will still be saved to Sheets. See setup steps below.")
+
+    example_videos = """1563160638	https://nivoda-inhousemedia.s3.amazonaws.com/inhouse-360-1563160638
+2566010524	https://vidpicture.com/show_video.asp?Source=Version_5.0&Stock_ID=713357&video=v360
+3535734963	https://diaassets.blob.core.windows.net/dim/hd/Vision360.html?d=B479-77-A"""
+    video_text = st.text_area(
+        "Certificate + Video URL (one per line)",
+        value=example_videos,
+        height=200,
+        key="video_bulk_input",
+    )
+    try_backup = st.checkbox("Try Google Drive backup for direct video files", value=True)
+
+    if st.button("💾 Save video links", type="primary", key="save_videos_btn"):
+        pairs = []
+        for line in video_text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Split on tab or multiple spaces
+            parts = re.split(r"\s+", line, maxsplit=1)
+            if len(parts) < 2:
+                st.warning(f"Skipped (need cert + URL): {line[:60]}")
+                continue
+            pairs.append((parts[0], parts[1]))
+
+        if not pairs:
+            st.error("No valid pairs found.")
+        else:
+            with st.spinner(f"Processing {len(pairs)} video link(s)..."):
+                results = save_video_urls(pairs, try_drive_backup=try_backup)
+            st.success(f"Processed {len(results)} link(s).")
+            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Setup Google Drive folder (one-time)")
+    st.markdown(
+        """
+1. Enable **Google Drive API** in the same Google Cloud project  
+2. In Google Drive, create a folder e.g. `IGI Video Backups`  
+3. Share that folder with your service account **client_email** as **Editor**  
+4. Copy the folder ID from the URL:
+   `https://drive.google.com/drive/folders/FOLDER_ID_HERE`  
+5. Add to Streamlit secrets:
+
+```toml
+[drive]
+folder_id = "FOLDER_ID_HERE"
+```
+
+6. Reboot the app  
+        """
+    )
 
 st.divider()
 st.caption("Data from official IGI PDFs / GIA Report Check. Inventory: Google Sheets when configured, else local SQLite.")
