@@ -47,7 +47,7 @@ st.set_page_config(
 )
 
 # -------------------------------------------------
-# Database (SQLite – persists across sessions)
+# Database layer: Google Sheets (preferred) + SQLite fallback
 # -------------------------------------------------
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory.db")
 
@@ -67,12 +67,61 @@ EDITABLE_COLUMNS = [
     "Price Per Carat", "Price For stone", "Comment"
 ]
 
+SHEET_HEADERS = INVENTORY_COLUMNS  # same order written to Google Sheet
+
+
+def _has_gsheets_secrets() -> bool:
+    try:
+        return (
+            "gcp_service_account" in st.secrets
+            and "sheets" in st.secrets
+            and st.secrets["sheets"].get("spreadsheet_id")
+        )
+    except Exception:
+        return False
+
+
+@st.cache_resource(show_spinner=False)
+def _get_gspread_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=scopes
+    )
+    return gspread.authorize(creds)
+
+
+def _open_worksheet():
+    client = _get_gspread_client()
+    sid = st.secrets["sheets"]["spreadsheet_id"]
+    ws_name = st.secrets["sheets"].get("worksheet_name", "Inventory")
+    sh = client.open_by_key(sid)
+    try:
+        ws = sh.worksheet(ws_name)
+    except Exception:
+        ws = sh.add_worksheet(title=ws_name, rows=2000, cols=len(SHEET_HEADERS))
+        ws.append_row(SHEET_HEADERS)
+    # Ensure header row exists
+    existing = ws.row_values(1)
+    if not existing:
+        ws.append_row(SHEET_HEADERS)
+    return ws
+
+
+def use_gsheets() -> bool:
+    return _has_gsheets_secrets()
+
 
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
 def init_db():
+    """Initialize SQLite fallback table."""
     conn = get_conn()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
@@ -106,6 +155,12 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    # If Google Sheets configured, ensure worksheet + header exist
+    if use_gsheets():
+        try:
+            _open_worksheet()
+        except Exception as e:
+            st.warning(f"Google Sheets init warning: {e}")
 
 
 def row_to_db_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -171,8 +226,118 @@ def db_dict_to_row(d: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _row_to_sheet_list(row: Dict[str, Any]) -> List[str]:
+    """Ordered values matching SHEET_HEADERS."""
+    d = row_to_db_dict(row)
+    mapping = {
+        "Certificate Number": d["certificate_number"],
+        "DESCRIPTION": d["description"],
+        "SHAPE AND CUT": d["shape_and_cut"],
+        "CARAT WEIGHT": d["carat_weight"],
+        "COLOR GRADE": d["color_grade"],
+        "CLARITY GRADE": d["clarity_grade"],
+        "MEASUREMENTS": d["measurements"],
+        "CUT": d["cut_grade"],
+        "POLISH": d["polish"],
+        "SYMMETRY": d["symmetry"],
+        "FLUORESCENCE": d["fluorescence"],
+        "Process": d["process"],
+        "FGI Item Number": d["fgi_item_number"],
+        "Date Shipped from India": d["date_shipped_from_india"],
+        "For stock or Customer": d["for_stock_or_customer"],
+        "Production Order #, if for stock": d["production_order"],
+        "Current Location/Status": d["current_location_status"],
+        "Price Per Carat": d["price_per_carat"],
+        "Price For stone": d["price_for_stone"],
+        "CERTIFICATE LINK": d["certificate_link"],
+        "Comment": d["comment"],
+        "Lab": d["lab"],
+        "Status": d["status"],
+        "Notes": d["notes"],
+        "date_added": d["date_added"],
+        "last_updated": d["last_updated"],
+    }
+    return [str(mapping.get(h, "") or "") for h in SHEET_HEADERS]
+
+
+def _sheet_records() -> List[Dict[str, str]]:
+    ws = _open_worksheet()
+    records = ws.get_all_records()
+    return records or []
+
+
 def upsert_rows(rows: List[Dict[str, Any]]):
     """Insert or update rows. Preserves existing editable fields on update."""
+    if use_gsheets():
+        _upsert_rows_gsheets(rows)
+    else:
+        _upsert_rows_sqlite(rows)
+
+
+def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
+    ws = _open_worksheet()
+    existing = ws.get_all_values()
+    if not existing:
+        ws.append_row(SHEET_HEADERS)
+        existing = [SHEET_HEADERS]
+
+    header = existing[0]
+    # Map certificate number -> row index (1-based in Sheets)
+    cert_col = 0
+    try:
+        cert_col = header.index("Certificate Number")
+    except ValueError:
+        cert_col = 0
+
+    index_by_cert = {}
+    for i, row in enumerate(existing[1:], start=2):
+        if len(row) > cert_col and row[cert_col]:
+            index_by_cert[row[cert_col].strip()] = i
+
+    # Column indices for editable fields (to preserve)
+    def col_idx(name):
+        try:
+            return header.index(name)
+        except ValueError:
+            return None
+
+    editable_idx = {name: col_idx(name) for name in EDITABLE_COLUMNS}
+    date_added_idx = col_idx("date_added")
+
+    for row in rows:
+        cert = (row.get("Certificate Number") or "").strip()
+        if not cert:
+            continue
+        values = _row_to_sheet_list(row)
+
+        if cert in index_by_cert:
+            ridx = index_by_cert[cert]
+            old = existing[ridx - 1] if ridx - 1 < len(existing) else []
+            # Preserve non-empty editable fields
+            for name, cidx in editable_idx.items():
+                if cidx is not None and cidx < len(old) and old[cidx]:
+                    # Find position in SHEET_HEADERS
+                    try:
+                        pos = SHEET_HEADERS.index(name)
+                        values[pos] = old[cidx]
+                    except ValueError:
+                        pass
+            # Preserve original date_added
+            if date_added_idx is not None and date_added_idx < len(old) and old[date_added_idx]:
+                try:
+                    pos = SHEET_HEADERS.index("date_added")
+                    values[pos] = old[date_added_idx]
+                except ValueError:
+                    pass
+            # Update row
+            end_col = chr(ord('A') + len(values) - 1) if len(values) <= 26 else "Z"
+            # Use update with range for full row
+            ws.update(f"A{ridx}", [values], value_input_option="USER_ENTERED")
+        else:
+            ws.append_row(values, value_input_option="USER_ENTERED")
+
+
+def _upsert_rows_sqlite(rows: List[Dict[str, Any]]):
     conn = get_conn()
     cur = conn.cursor()
     for row in rows:
@@ -188,7 +353,6 @@ def upsert_rows(rows: List[Dict[str, Any]]):
 
         d = row_to_db_dict(row)
         if existing:
-            # Keep user-editable fields that already have values
             (fgi, shipped, stock, po, loc, ppc, pfs, comment, date_added) = existing
             if fgi:
                 d["fgi_item_number"] = fgi
@@ -206,7 +370,7 @@ def upsert_rows(rows: List[Dict[str, Any]]):
                 d["price_for_stone"] = pfs
             if comment:
                 d["comment"] = comment
-            d["date_added"] = date_added  # keep original add date
+            d["date_added"] = date_added
 
         cur.execute("""
             INSERT INTO inventory (
@@ -253,6 +417,21 @@ def upsert_rows(rows: List[Dict[str, Any]]):
 
 
 def load_all_inventory() -> pd.DataFrame:
+    if use_gsheets():
+        try:
+            records = _sheet_records()
+            if not records:
+                return pd.DataFrame(columns=INVENTORY_COLUMNS)
+            df = pd.DataFrame(records)
+            # Ensure all expected columns exist
+            for c in INVENTORY_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[INVENTORY_COLUMNS]
+        except Exception as e:
+            st.error(f"Google Sheets read error: {e}")
+            return pd.DataFrame(columns=INVENTORY_COLUMNS)
+
     conn = get_conn()
     df = pd.read_sql_query("SELECT * FROM inventory ORDER BY date_added DESC", conn)
     conn.close()
@@ -264,6 +443,48 @@ def load_all_inventory() -> pd.DataFrame:
 
 def update_editable_fields(df_edit: pd.DataFrame):
     """Save only the editable columns for existing certificates."""
+    if use_gsheets():
+        _update_editable_gsheets(df_edit)
+    else:
+        _update_editable_sqlite(df_edit)
+
+
+def _update_editable_gsheets(df_edit: pd.DataFrame):
+    ws = _open_worksheet()
+    existing = ws.get_all_values()
+    if len(existing) < 2:
+        return
+    header = existing[0]
+    try:
+        cert_col = header.index("Certificate Number")
+    except ValueError:
+        return
+
+    index_by_cert = {}
+    for i, row in enumerate(existing[1:], start=2):
+        if len(row) > cert_col and row[cert_col]:
+            index_by_cert[row[cert_col].strip()] = i
+
+    now = datetime.now().isoformat(timespec="seconds")
+    last_upd_idx = header.index("last_updated") if "last_updated" in header else None
+
+    for _, row in df_edit.iterrows():
+        cert = str(row.get("Certificate Number", "")).strip()
+        if not cert or cert not in index_by_cert:
+            continue
+        ridx = index_by_cert[cert]
+        for name in EDITABLE_COLUMNS:
+            if name not in header:
+                continue
+            cidx = header.index(name)
+            val = str(row.get(name) or "")
+            # gspread is 1-based rows/cols
+            ws.update_cell(ridx, cidx + 1, val)
+        if last_upd_idx is not None:
+            ws.update_cell(ridx, last_upd_idx + 1, now)
+
+
+def _update_editable_sqlite(df_edit: pd.DataFrame):
     conn = get_conn()
     cur = conn.cursor()
     now = datetime.now().isoformat(timespec="seconds")
@@ -301,20 +522,15 @@ def update_editable_fields(df_edit: pd.DataFrame):
 
 def count_added_today() -> int:
     today = date.today().isoformat()
-    conn = get_conn()
-    n = conn.execute(
-        "SELECT COUNT(*) FROM inventory WHERE date_added LIKE ?",
-        (f"{today}%",)
-    ).fetchone()[0]
-    conn.close()
-    return n
+    df = load_all_inventory()
+    if df.empty or "date_added" not in df.columns:
+        return 0
+    return int(df["date_added"].astype(str).str.startswith(today).sum())
 
 
 def total_count() -> int:
-    conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) FROM inventory").fetchone()[0]
-    conn.close()
-    return n
+    df = load_all_inventory()
+    return len(df)
 
 
 init_db()
@@ -858,7 +1074,11 @@ with st.sidebar:
         """
     )
     st.divider()
-    st.caption("SQLite database: inventory.db")
+    if use_gsheets():
+        st.success("Storage: Google Sheets (persistent)")
+    else:
+        st.warning("Storage: local SQLite (cleared on sleep)")
+        st.caption("Add Google Sheet secrets for permanent storage")
 
 # ---------- Tabs ----------
 tab_add, tab_all, tab_edit = st.tabs([
@@ -1158,4 +1378,4 @@ with tab_edit:
             st.rerun()
 
 st.divider()
-st.caption("Data sourced live from official IGI PDFs and GIA Report Check. Inventory stored in local SQLite (inventory.db).")
+st.caption("Data from official IGI PDFs / GIA Report Check. Inventory: Google Sheets when configured, else local SQLite.")
