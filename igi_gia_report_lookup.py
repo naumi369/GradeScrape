@@ -610,6 +610,102 @@ def total_count() -> int:
     return len(df)
 
 
+def _parse_carat(val) -> float:
+    try:
+        m = re.search(r"[\d.]+", str(val))
+        return float(m.group()) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+def _parse_money(val) -> float:
+    try:
+        s = re.sub(r"[^\d.]", "", str(val))
+        return float(s) if s else 0.0
+    except Exception:
+        return 0.0
+
+
+def inventory_subtotals(df: pd.DataFrame) -> Dict[str, Any]:
+    """Compute summary stats for a filtered inventory dataframe."""
+    if df is None or df.empty:
+        return {
+            "count": 0,
+            "total_carat": 0.0,
+            "avg_carat": 0.0,
+            "total_price": 0.0,
+            "by_shape": {},
+            "by_color": {},
+            "by_clarity": {},
+            "with_video": 0,
+        }
+    carats = df["CARAT WEIGHT"].apply(_parse_carat) if "CARAT WEIGHT" in df.columns else pd.Series([0.0] * len(df))
+    prices = df["Price For stone"].apply(_parse_money) if "Price For stone" in df.columns else pd.Series([0.0] * len(df))
+    with_video = 0
+    if "Video URL" in df.columns:
+        with_video = int((df["Video URL"].fillna("").astype(str).str.strip() != "").sum())
+
+    by_shape, by_color, by_clarity = {}, {}, {}
+    if "SHAPE AND CUT" in df.columns:
+        by_shape = df["SHAPE AND CUT"].fillna("").astype(str).str.strip().replace("", "Unknown").value_counts().head(8).to_dict()
+    if "COLOR GRADE" in df.columns:
+        by_color = df["COLOR GRADE"].fillna("").astype(str).str.strip().replace("", "Unknown").value_counts().to_dict()
+    if "CLARITY GRADE" in df.columns:
+        by_clarity = df["CLARITY GRADE"].fillna("").astype(str).str.strip().replace("", "Unknown").value_counts().to_dict()
+
+    total_ct = float(carats.sum())
+    return {
+        "count": len(df),
+        "total_carat": total_ct,
+        "avg_carat": float(carats.mean()) if len(df) else 0.0,
+        "total_price": float(prices.sum()),
+        "by_shape": by_shape,
+        "by_color": by_color,
+        "by_clarity": by_clarity,
+        "with_video": with_video,
+    }
+
+
+def render_inventory_subtotals(df: pd.DataFrame, title: str = "Subtotals"):
+    """Show summary metrics + breakdown tables."""
+    s = inventory_subtotals(df)
+    st.markdown(f"**{title}**")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Pieces", s["count"])
+    c2.metric("Total carat", f"{s['total_carat']:.2f}")
+    c3.metric("Avg carat", f"{s['avg_carat']:.2f}")
+    c4.metric("Total stone price", f"{s['total_price']:,.0f}" if s["total_price"] else "—")
+    c5.metric("With video URL", s["with_video"])
+
+    if s["count"] == 0:
+        return
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        st.caption("By shape")
+        if s["by_shape"]:
+            st.dataframe(
+                pd.DataFrame({"Shape": list(s["by_shape"].keys()), "Count": list(s["by_shape"].values())}),
+                hide_index=True,
+                use_container_width=True,
+            )
+    with b2:
+        st.caption("By color")
+        if s["by_color"]:
+            st.dataframe(
+                pd.DataFrame({"Color": list(s["by_color"].keys()), "Count": list(s["by_color"].values())}),
+                hide_index=True,
+                use_container_width=True,
+            )
+    with b3:
+        st.caption("By clarity")
+        if s["by_clarity"]:
+            st.dataframe(
+                pd.DataFrame({"Clarity": list(s["by_clarity"].keys()), "Count": list(s["by_clarity"].values())}),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+
 init_db()
 
 # -------------------------------------------------
@@ -731,26 +827,38 @@ def empty_inventory_row(cert: str = "", lab: str = "") -> Dict[str, Any]:
 
 
 def probe_video_url(url: str) -> Dict[str, Any]:
-    """Check if URL is a direct downloadable video file."""
+    """Check if URL is a direct downloadable video, or find an mp4 inside an HTML page."""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = requests.get(url, headers=headers, timeout=20, allow_redirects=True, stream=True)
+        r = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
         ct = (r.headers.get("Content-Type") or "").lower()
         size = r.headers.get("Content-Length")
-        is_video = any(x in ct for x in ("video/", "mp4", "webm", "quicktime", "octet-stream"))
-        # Some S3 links return video/mp4
-        if "video/" in ct or url.lower().endswith((".mp4", ".webm", ".mov")):
-            is_video = True
+        final = r.url
+        is_video = ("video/" in ct) or final.lower().endswith((".mp4", ".webm", ".mov"))
+
+        # If HTML page, try to extract a direct .mp4 URL from the source
+        found_mp4 = None
+        if r.status_code == 200 and "html" in ct:
+            mp4s = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', r.text, flags=re.I)
+            if mp4s:
+                found_mp4 = mp4s[0].replace("&amp;", "&")
+                is_video = True
+                final = found_mp4
+
         return {
             "ok": r.status_code == 200,
             "status": r.status_code,
             "content_type": ct,
-            "size": int(size) if size and size.isdigit() else None,
-            "is_direct_video": is_video and r.status_code == 200,
-            "final_url": r.url,
+            "size": int(size) if size and str(size).isdigit() else None,
+            "is_direct_video": bool(is_video and r.status_code == 200),
+            "final_url": final,
+            "extracted_mp4": found_mp4,
         }
     except Exception as e:
-        return {"ok": False, "status": 0, "content_type": "", "size": None, "is_direct_video": False, "error": str(e)}
+        return {
+            "ok": False, "status": 0, "content_type": "", "size": None,
+            "is_direct_video": False, "final_url": url, "error": str(e),
+        }
 
 
 def download_and_upload_video_to_drive(cert: str, url: str) -> Dict[str, Any]:
@@ -765,13 +873,14 @@ def download_and_upload_video_to_drive(cert: str, url: str) -> Dict[str, Any]:
     if not probe.get("is_direct_video"):
         return {
             "success": False,
-            "error": f"Not a direct video file (type={probe.get('content_type') or 'unknown'})",
+            "error": f"Not a direct video file (type={probe.get('content_type') or 'unknown'}). Vision360/DNA HTML cannot be converted to MP4 automatically.",
             "link_saved_only": True,
         }
 
+    download_url = probe.get("extracted_mp4") or probe.get("final_url") or url
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = requests.get(url, headers=headers, timeout=120, allow_redirects=True)
+        r = requests.get(download_url, headers=headers, timeout=180, allow_redirects=True)
         if r.status_code != 200:
             return {"success": False, "error": f"Download HTTP {r.status_code}"}
 
@@ -1536,6 +1645,7 @@ with tab_all:
         view = smart_filter(view, search_q)
 
     st.caption(f"Showing **{len(view)}** of **{len(df_all)}** certificates")
+    render_inventory_subtotals(view, title="Subtotals (filtered view)")
     st.dataframe(view, use_container_width=True, hide_index=True)
 
     if not view.empty:
@@ -1561,6 +1671,8 @@ with tab_edit:
     if df_all.empty:
         st.info("No certificates in the database yet. Add some in the first tab.")
     else:
+        render_inventory_subtotals(df_all, title="Subtotals (full inventory)")
+
         # Show only key + editable columns for editing
         edit_cols = ["Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"] + EDITABLE_COLUMNS
         edit_cols = [c for c in edit_cols if c in df_all.columns]
@@ -1580,6 +1692,9 @@ with tab_edit:
                 "CLARITY GRADE": st.column_config.TextColumn(disabled=True),
             }
         )
+
+        # Live subtotals from editor values (prices etc.)
+        render_inventory_subtotals(edited, title="Subtotals (as shown in editor)")
 
         if st.button("💾 Save changes to database", type="primary"):
             update_editable_fields(edited)
