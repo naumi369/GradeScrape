@@ -95,7 +95,9 @@ def _get_gspread_client():
     return gspread.authorize(creds)
 
 
+@st.cache_resource(show_spinner=False)
 def _open_worksheet():
+    """Cached worksheet handle – avoids re-opening on every rerun."""
     client = _get_gspread_client()
     sid = st.secrets["sheets"]["spreadsheet_id"]
     ws_name = st.secrets["sheets"].get("worksheet_name", "Inventory")
@@ -104,10 +106,6 @@ def _open_worksheet():
         ws = sh.worksheet(ws_name)
     except Exception:
         ws = sh.add_worksheet(title=ws_name, rows=2000, cols=len(SHEET_HEADERS))
-        ws.append_row(SHEET_HEADERS)
-    # Ensure header row exists
-    existing = ws.row_values(1)
-    if not existing:
         ws.append_row(SHEET_HEADERS)
     return ws
 
@@ -121,7 +119,7 @@ def get_conn():
 
 
 def init_db():
-    """Initialize SQLite fallback table."""
+    """Initialize SQLite fallback table. Does not hit Google Sheets on every run."""
     conn = get_conn()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
@@ -155,12 +153,6 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    # If Google Sheets configured, ensure worksheet + header exist
-    if use_gsheets():
-        try:
-            _open_worksheet()
-        except Exception as e:
-            st.warning(f"Google Sheets init warning: {e}")
 
 
 def row_to_db_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -270,6 +262,7 @@ def upsert_rows(rows: List[Dict[str, Any]]):
     """Insert or update rows. Preserves existing editable fields on update."""
     if use_gsheets():
         _upsert_rows_gsheets(rows)
+        clear_inventory_cache()
     else:
         _upsert_rows_sqlite(rows)
 
@@ -416,20 +409,30 @@ def _upsert_rows_sqlite(rows: List[Dict[str, Any]]):
     conn.close()
 
 
+@st.cache_data(ttl=90, show_spinner=False)
+def _load_gsheets_inventory() -> pd.DataFrame:
+    """Cached read from Google Sheets (90s) to stay under API quota."""
+    records = _sheet_records()
+    if not records:
+        return pd.DataFrame(columns=INVENTORY_COLUMNS)
+    df = pd.DataFrame(records)
+    for c in INVENTORY_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    return df[INVENTORY_COLUMNS]
+
+
 def load_all_inventory() -> pd.DataFrame:
     if use_gsheets():
         try:
-            records = _sheet_records()
-            if not records:
-                return pd.DataFrame(columns=INVENTORY_COLUMNS)
-            df = pd.DataFrame(records)
-            # Ensure all expected columns exist
-            for c in INVENTORY_COLUMNS:
-                if c not in df.columns:
-                    df[c] = ""
-            return df[INVENTORY_COLUMNS]
+            return _load_gsheets_inventory()
         except Exception as e:
-            st.error(f"Google Sheets read error: {e}")
+            # Don't spam errors on quota – show once-friendly message
+            msg = str(e)
+            if "429" in msg or "Quota" in msg:
+                st.warning("Google Sheets quota hit – showing cached/empty data. Wait ~1 minute and refresh.")
+            else:
+                st.error(f"Google Sheets read error: {e}")
             return pd.DataFrame(columns=INVENTORY_COLUMNS)
 
     conn = get_conn()
@@ -441,15 +444,26 @@ def load_all_inventory() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def clear_inventory_cache():
+    """Call after any write so the next read is fresh."""
+    try:
+        _load_gsheets_inventory.clear()
+    except Exception:
+        pass
+
+
 def update_editable_fields(df_edit: pd.DataFrame):
     """Save only the editable columns for existing certificates."""
     if use_gsheets():
         _update_editable_gsheets(df_edit)
+        clear_inventory_cache()
     else:
         _update_editable_sqlite(df_edit)
 
 
 def _update_editable_gsheets(df_edit: pd.DataFrame):
+    """Batch-update editable fields (far fewer API calls than update_cell)."""
+    import gspread
     ws = _open_worksheet()
     existing = ws.get_all_values()
     if len(existing) < 2:
@@ -466,8 +480,7 @@ def _update_editable_gsheets(df_edit: pd.DataFrame):
             index_by_cert[row[cert_col].strip()] = i
 
     now = datetime.now().isoformat(timespec="seconds")
-    last_upd_idx = header.index("last_updated") if "last_updated" in header else None
-
+    cells = []
     for _, row in df_edit.iterrows():
         cert = str(row.get("Certificate Number", "")).strip()
         if not cert or cert not in index_by_cert:
@@ -476,12 +489,14 @@ def _update_editable_gsheets(df_edit: pd.DataFrame):
         for name in EDITABLE_COLUMNS:
             if name not in header:
                 continue
-            cidx = header.index(name)
+            cidx = header.index(name) + 1
             val = str(row.get(name) or "")
-            # gspread is 1-based rows/cols
-            ws.update_cell(ridx, cidx + 1, val)
-        if last_upd_idx is not None:
-            ws.update_cell(ridx, last_upd_idx + 1, now)
+            cells.append(gspread.Cell(ridx, cidx, val))
+        if "last_updated" in header:
+            cells.append(gspread.Cell(ridx, header.index("last_updated") + 1, now))
+
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
 
 
 def _update_editable_sqlite(df_edit: pd.DataFrame):
@@ -1055,8 +1070,14 @@ st.caption("Live report lookup + persistent inventory database")
 # Sidebar
 with st.sidebar:
     st.header("📊 Inventory Stats")
-    st.metric("Total certificates", total_count())
-    st.metric("Added today", count_added_today())
+    # Single load for both metrics (uses cache)
+    _stats_df = load_all_inventory()
+    st.metric("Total certificates", len(_stats_df))
+    _today = date.today().isoformat()
+    _added_today = 0
+    if not _stats_df.empty and "date_added" in _stats_df.columns:
+        _added_today = int(_stats_df["date_added"].astype(str).str.startswith(_today).sum())
+    st.metric("Added today", _added_today)
     st.divider()
     st.header("Settings")
     use_playwright = st.toggle(
