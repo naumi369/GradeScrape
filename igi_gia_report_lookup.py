@@ -277,10 +277,47 @@ def _row_to_sheet_list(row: Dict[str, Any]) -> List[str]:
     return [str(mapping.get(h, "") or "") for h in SHEET_HEADERS]
 
 
+def _ensure_sheet_headers(ws) -> None:
+    """Rewrite row 1 if it has blanks/duplicates or is missing new columns."""
+    current = ws.row_values(1)
+    needs_fix = (
+        not current
+        or any((h or "").strip() == "" for h in current)
+        or len(set(current)) != len(current)
+        or list(current[: len(SHEET_HEADERS)]) != list(SHEET_HEADERS)
+    )
+    if needs_fix:
+        ws.update("A1", [SHEET_HEADERS], value_input_option="USER_ENTERED")
+
+
 def _sheet_records() -> List[Dict[str, str]]:
     ws = _open_worksheet()
-    records = ws.get_all_records()
-    return records or []
+    try:
+        _ensure_sheet_headers(ws)
+    except Exception:
+        pass
+
+    # Prefer expected_headers (gspread ≥5) so duplicate blanks don't crash
+    try:
+        records = ws.get_all_records(expected_headers=SHEET_HEADERS)
+        return records or []
+    except TypeError:
+        pass
+    except Exception:
+        pass
+
+    # Manual parse fallback
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    header = SHEET_HEADERS
+    rows = []
+    for raw in values[1:]:
+        if not any(str(c).strip() for c in raw):
+            continue
+        padded = list(raw) + [""] * max(0, len(header) - len(raw))
+        rows.append({header[i]: padded[i] for i in range(len(header))})
+    return rows
 
 
 def upsert_rows(rows: List[Dict[str, Any]]):
