@@ -666,44 +666,42 @@ def inventory_subtotals(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def render_inventory_subtotals(df: pd.DataFrame, title: str = "Subtotals"):
-    """Show summary metrics + breakdown tables."""
+def render_inventory_subtotals(df: pd.DataFrame, title: str = "Subtotals", expanded: bool = False):
+    """Compact summary in an expander so the table stays primary."""
     s = inventory_subtotals(df)
-    st.markdown(f"**{title}**")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Pieces", s["count"])
-    c2.metric("Total carat", f"{s['total_carat']:.2f}")
-    c3.metric("Avg carat", f"{s['avg_carat']:.2f}")
-    c4.metric("Total stone price", f"{s['total_price']:,.0f}" if s["total_price"] else "—")
-    c5.metric("With video URL", s["with_video"])
-
-    if s["count"] == 0:
-        return
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        st.caption("By shape")
-        if s["by_shape"]:
-            st.dataframe(
-                pd.DataFrame({"Shape": list(s["by_shape"].keys()), "Count": list(s["by_shape"].values())}),
-                hide_index=True,
-                use_container_width=True,
-            )
-    with b2:
-        st.caption("By color")
-        if s["by_color"]:
-            st.dataframe(
-                pd.DataFrame({"Color": list(s["by_color"].keys()), "Count": list(s["by_color"].values())}),
-                hide_index=True,
-                use_container_width=True,
-            )
-    with b3:
-        st.caption("By clarity")
-        if s["by_clarity"]:
-            st.dataframe(
-                pd.DataFrame({"Clarity": list(s["by_clarity"].keys()), "Count": list(s["by_clarity"].values())}),
-                hide_index=True,
-                use_container_width=True,
-            )
+    price_txt = f"{s['total_price']:,.0f}" if s["total_price"] else "—"
+    label = (
+        f"Σ {title}:  {s['count']} pcs · {s['total_carat']:.2f} ct · "
+        f"avg {s['avg_carat']:.2f} · price {price_txt} · video {s['with_video']}"
+    )
+    with st.expander(label, expanded=expanded):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Pieces", s["count"])
+        c2.metric("Total ct", f"{s['total_carat']:.2f}")
+        c3.metric("Avg ct", f"{s['avg_carat']:.2f}")
+        c4.metric("Price Σ", price_txt)
+        c5.metric("Video", s["with_video"])
+        if s["count"] == 0:
+            return
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if s["by_shape"]:
+                st.dataframe(
+                    pd.DataFrame({"Shape": list(s["by_shape"].keys()), "#": list(s["by_shape"].values())}),
+                    hide_index=True, use_container_width=True, height=160,
+                )
+        with b2:
+            if s["by_color"]:
+                st.dataframe(
+                    pd.DataFrame({"Color": list(s["by_color"].keys()), "#": list(s["by_color"].values())}),
+                    hide_index=True, use_container_width=True, height=160,
+                )
+        with b3:
+            if s["by_clarity"]:
+                st.dataframe(
+                    pd.DataFrame({"Clarity": list(s["by_clarity"].keys()), "#": list(s["by_clarity"].values())}),
+                    hide_index=True, use_container_width=True, height=160,
+                )
 
 
 init_db()
@@ -1509,31 +1507,22 @@ LG834619611"""
 # TAB 2 – All Inventory
 # =========================================================
 with tab_all:
-    st.subheader("Full inventory database")
     df_all = load_all_inventory()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total in DB", len(df_all))
-    c2.metric("Added today", count_added_today())
-    if not df_all.empty and "Lab" in df_all.columns:
-        c3.metric("IGI", len(df_all[df_all["Lab"] == "IGI"]))
-        c4.metric("GIA", len(df_all[df_all["Lab"] == "GIA"]))
-
-    # ---- Smart search bar ----
-    st.markdown("**🔍 Smart search** — e.g. `2 CT Oval VS2` · `E color pear` · `CVD 3ct` · `LG831`")
-    search_q = st.text_input(
-        "Search inventory",
-        value="",
-        placeholder="Type shape, carat, color, clarity, process, certificate #…",
-        label_visibility="collapsed",
-        key="inventory_search",
-    )
-
-    f1, f2 = st.columns(2)
-    with f1:
-        filter_lab = st.selectbox("Filter by Lab", ["All", "IGI", "GIA", "Unknown"], key="lab_filter")
-    with f2:
-        filter_today = st.checkbox("Show only added today", value=False, key="today_filter")
+    # Compact toolbar: search + filters on one row
+    t1, t2, t3 = st.columns([3, 1, 1])
+    with t1:
+        search_q = st.text_input(
+            "Search",
+            value="",
+            placeholder="🔍  2 CT Oval VS2  ·  E pear  ·  CVD  ·  LG831",
+            label_visibility="collapsed",
+            key="inventory_search",
+        )
+    with t2:
+        filter_lab = st.selectbox("Lab", ["All", "IGI", "GIA", "Unknown"], key="lab_filter", label_visibility="collapsed")
+    with t3:
+        filter_today = st.checkbox("Today only", value=False, key="today_filter")
 
     def smart_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
         """Filter inventory using natural-ish phrases like '2 CT Oval VS2' or 'emerald 2ct'."""
@@ -1644,17 +1633,20 @@ with tab_all:
     if search_q.strip() and not view.empty:
         view = smart_filter(view, search_q)
 
-    st.caption(f"Showing **{len(view)}** of **{len(df_all)}** certificates")
-    render_inventory_subtotals(view, title="Subtotals (filtered view)")
-    st.dataframe(view, use_container_width=True, hide_index=True)
-
+    render_inventory_subtotals(view, title=f"{len(view)}/{len(df_all)} shown")
+    st.dataframe(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        height=520,
+    )
     if not view.empty:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             export = view.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns], errors="ignore")
             export.to_excel(writer, index=False, sheet_name="Inventory")
         st.download_button(
-            "📥 Download filtered inventory (Excel)",
+            "📥 Excel",
             data=buffer.getvalue(),
             file_name="Filtered_Inventory.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1664,17 +1656,16 @@ with tab_all:
 # TAB 3 – Edit editable fields
 # =========================================================
 with tab_edit:
-    st.subheader("Edit user fields (FGI Item #, prices, location, etc.)")
-    st.caption("Change the yellow columns, then click **Save changes**.")
-
     df_all = load_all_inventory()
     if df_all.empty:
-        st.info("No certificates in the database yet. Add some in the first tab.")
+        st.info("No certificates yet — add some in **Add New**.")
     else:
-        render_inventory_subtotals(df_all, title="Subtotals (full inventory)")
+        render_inventory_subtotals(df_all, title="inventory")
 
-        # Show only key + editable columns for editing
-        edit_cols = ["Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"] + EDITABLE_COLUMNS
+        edit_cols = [
+            "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT",
+            "COLOR GRADE", "CLARITY GRADE",
+        ] + EDITABLE_COLUMNS
         edit_cols = [c for c in edit_cols if c in df_all.columns]
         df_edit = df_all[edit_cols].copy()
 
@@ -1683,23 +1674,23 @@ with tab_edit:
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
+            height=480,
             key="inventory_editor",
             column_config={
-                "Certificate Number": st.column_config.TextColumn(disabled=True),
-                "SHAPE AND CUT": st.column_config.TextColumn(disabled=True),
-                "CARAT WEIGHT": st.column_config.TextColumn(disabled=True),
-                "COLOR GRADE": st.column_config.TextColumn(disabled=True),
-                "CLARITY GRADE": st.column_config.TextColumn(disabled=True),
-            }
+                "Certificate Number": st.column_config.TextColumn(disabled=True, width="small"),
+                "SHAPE AND CUT": st.column_config.TextColumn(disabled=True, width="small"),
+                "CARAT WEIGHT": st.column_config.TextColumn(disabled=True, width="small"),
+                "COLOR GRADE": st.column_config.TextColumn(disabled=True, width="small"),
+                "CLARITY GRADE": st.column_config.TextColumn(disabled=True, width="small"),
+            },
         )
 
-        # Live subtotals from editor values (prices etc.)
-        render_inventory_subtotals(edited, title="Subtotals (as shown in editor)")
-
-        if st.button("💾 Save changes to database", type="primary"):
-            update_editable_fields(edited)
-            st.success("Editable fields saved.")
-            st.rerun()
+        b1, b2 = st.columns([1, 4])
+        with b1:
+            if st.button("💾 Save", type="primary", use_container_width=True):
+                update_editable_fields(edited)
+                st.success("Saved.")
+                st.rerun()
 
 # =========================================================
 # TAB 4 – Video links & Drive backup
