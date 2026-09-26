@@ -685,6 +685,95 @@ def inventory_subtotals(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: bool = True):
+    """Show certificate PDF preview + optional Drive backup (used after row click)."""
+    cert = str(cert or "").strip()
+    if not cert:
+        return
+    st.markdown(f"### 📄 {cert}")
+    existing = load_all_inventory()
+    link = cert_link
+    backup_link = ""
+    match_row = None
+    if not existing.empty and "Certificate Number" in existing.columns:
+        match = existing[existing["Certificate Number"].astype(str) == cert]
+        if not match.empty:
+            match_row = match.iloc[0].to_dict()
+            if not link:
+                link = str(match_row.get("CERTIFICATE LINK") or "")
+            backup_link = str(match_row.get("Certificate PDF Backup Drive Link") or "").strip()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        do_backup = st.button("☁ Backup to Drive", key=f"prev_bak_{cert}", disabled=not _has_gdrive_folder())
+    with c2:
+        st.button("🔄 Reload preview", key=f"prev_rel_{cert}")
+    with c3:
+        if backup_link:
+            st.markdown(f"[Open Drive backup]({backup_link})")
+
+    pdf_bytes = None
+    if do_backup and _has_gdrive_folder():
+        with st.spinner("Backing up PDF…"):
+            res = backup_certificate_pdf_to_drive(cert, link)
+        if res.get("success"):
+            row = match_row or empty_inventory_row(cert, infer_lab(cert))
+            row["Certificate Number"] = cert
+            row["Certificate PDF Backup Drive Link"] = res["drive_link"]
+            if link:
+                row["CERTIFICATE LINK"] = link
+            upsert_rows([row])
+            st.success("Saved to Drive")
+            pdf_bytes = res.get("pdf_bytes")
+            backup_link = res["drive_link"]
+        else:
+            st.error(res.get("error", "Backup failed"))
+
+    if pdf_bytes is None:
+        with st.spinner("Loading certificate PDF…"):
+            dl = download_certificate_pdf(cert, link)
+        if not dl.get("success"):
+            st.warning(dl.get("error", "Could not load PDF for preview"))
+            return
+        pdf_bytes = dl["pdf_bytes"]
+
+    images = pdf_to_preview_images(pdf_bytes, max_pages=2, scale=1.5)
+    if images:
+        for i, img in enumerate(images):
+            st.image(img, caption=f"Page {i+1}", use_container_width=True)
+    else:
+        st.info("PDF loaded but image render failed — download below.")
+    st.download_button(
+        "⬇ Download PDF",
+        data=pdf_bytes,
+        file_name=f"{cert}_certificate.pdf",
+        mime="application/pdf",
+        key=f"prev_dl_{cert}",
+    )
+
+
+# Modal popup when Streamlit supports st.dialog
+try:
+    @st.dialog("Certificate preview", width="large")
+    def certificate_preview_dialog(cert: str, cert_link: str = ""):
+        render_certificate_preview(cert, cert_link)
+    HAS_DIALOG = True
+except Exception:
+    HAS_DIALOG = False
+
+
+def open_certificate_preview(cert: str, cert_link: str = ""):
+    """Open preview as dialog if available, else store in session for inline panel."""
+    cert = str(cert or "").strip()
+    if not cert:
+        return
+    if HAS_DIALOG:
+        certificate_preview_dialog(cert, cert_link)
+    else:
+        st.session_state["inline_preview_cert"] = cert
+        st.session_state["inline_preview_link"] = cert_link or ""
+
+
 def render_inventory_subtotals(df: pd.DataFrame, title: str = "Subtotals", expanded: bool = False):
     """Compact summary in an expander so the table stays primary."""
     s = inventory_subtotals(df)
@@ -1654,7 +1743,21 @@ LG834619611"""
         m3.metric("GIA", len(df_new[df_new["Lab"] == "GIA"]) if "Lab" in df_new.columns else 0)
         m4.metric("Added today (total)", count_added_today())
 
-        st.dataframe(df_new, use_container_width=True, hide_index=True)
+        st.caption("Click a row to preview certificate")
+        try:
+            ev_new = st.dataframe(
+                df_new, use_container_width=True, hide_index=True,
+                on_select="rerun", selection_mode="single-row", key="batch_table_select",
+            )
+            sel_n = ev_new.selection.rows if ev_new and ev_new.selection else []
+            if sel_n and sel_n[0] < len(df_new):
+                crow = df_new.iloc[sel_n[0]]
+                open_certificate_preview(
+                    str(crow.get("Certificate Number", "")),
+                    str(crow.get("CERTIFICATE LINK", "") or ""),
+                )
+        except TypeError:
+            st.dataframe(df_new, use_container_width=True, hide_index=True)
 
         # Download this batch
         buffer = io.BytesIO()
@@ -1799,13 +1902,53 @@ with tab_all:
         view = smart_filter(view, search_q)
 
     render_inventory_subtotals(view, title=f"{len(view)}/{len(df_all)} shown")
-    st.dataframe(
-        view,
-        use_container_width=True,
-        hide_index=True,
-        height=520,
-    )
-    if not view.empty:
+    st.caption("Click a **row** to preview that certificate PDF")
+
+    if view.empty:
+        st.info("No rows to show.")
+    else:
+        try:
+            event = st.dataframe(
+                view,
+                use_container_width=True,
+                hide_index=True,
+                height=520,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="inventory_table_select",
+            )
+            sel_rows = event.selection.rows if event and event.selection else []
+            if sel_rows:
+                ridx = sel_rows[0]
+                if ridx < len(view):
+                    crow = view.iloc[ridx]
+                    open_certificate_preview(
+                        str(crow.get("Certificate Number", "")),
+                        str(crow.get("CERTIFICATE LINK", "") or ""),
+                    )
+        except TypeError:
+            # Older Streamlit without on_select
+            st.dataframe(view, use_container_width=True, hide_index=True, height=520)
+            pick = st.selectbox(
+                "Or pick certificate to preview",
+                view["Certificate Number"].astype(str).tolist(),
+                key="inv_preview_pick",
+            )
+            if st.button("Preview selected", key="inv_preview_btn"):
+                link = ""
+                m = view[view["Certificate Number"].astype(str) == pick]
+                if not m.empty:
+                    link = str(m.iloc[0].get("CERTIFICATE LINK") or "")
+                open_certificate_preview(pick, link)
+
+        # Inline fallback panel when dialog is unavailable
+        if not HAS_DIALOG and st.session_state.get("inline_preview_cert"):
+            with st.expander(f"Preview: {st.session_state['inline_preview_cert']}", expanded=True):
+                render_certificate_preview(
+                    st.session_state["inline_preview_cert"],
+                    st.session_state.get("inline_preview_link", ""),
+                )
+
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             export = view.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns], errors="ignore")
@@ -1834,12 +1977,30 @@ with tab_edit:
         edit_cols = [c for c in edit_cols if c in df_all.columns]
         df_edit = df_all[edit_cols].copy()
 
+        st.caption("Select a row below, or pick a certificate to preview")
+        try:
+            event_e = st.dataframe(
+                df_edit,
+                use_container_width=True,
+                hide_index=True,
+                height=200,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="edit_table_select",
+            )
+            sel_e = event_e.selection.rows if event_e and event_e.selection else []
+            if sel_e and sel_e[0] < len(df_edit):
+                crow = df_edit.iloc[sel_e[0]]
+                open_certificate_preview(str(crow.get("Certificate Number", "")), "")
+        except TypeError:
+            pass
+
         edited = st.data_editor(
             df_edit,
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
-            height=480,
+            height=400,
             key="inventory_editor",
             column_config={
                 "Certificate Number": st.column_config.TextColumn(disabled=True, width="small"),
@@ -1850,12 +2011,29 @@ with tab_edit:
             },
         )
 
-        b1, b2 = st.columns([1, 4])
+        b1, b2, b3 = st.columns([1, 2, 2])
         with b1:
             if st.button("💾 Save", type="primary", use_container_width=True):
                 update_editable_fields(edited)
                 st.success("Saved.")
                 st.rerun()
+        with b2:
+            pick_e = st.selectbox(
+                "Preview cert",
+                edited["Certificate Number"].astype(str).tolist(),
+                key="edit_preview_pick",
+                label_visibility="collapsed",
+            )
+        with b3:
+            if st.button("👁 Preview", use_container_width=True, key="edit_preview_btn"):
+                open_certificate_preview(pick_e, "")
+
+        if not HAS_DIALOG and st.session_state.get("inline_preview_cert"):
+            with st.expander(f"Preview: {st.session_state['inline_preview_cert']}", expanded=True):
+                render_certificate_preview(
+                    st.session_state["inline_preview_cert"],
+                    st.session_state.get("inline_preview_link", ""),
+                )
 
 # =========================================================
 # TAB 4 – Video links & Drive backup
