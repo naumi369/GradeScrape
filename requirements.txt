@@ -7,3 +7,5 @@ pypdf
 gspread
 google-auth
 google-api-python-client
+pypdfium2
+Pillow

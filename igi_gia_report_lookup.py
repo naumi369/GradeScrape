@@ -59,6 +59,7 @@ INVENTORY_COLUMNS = [
     "Production Order #, if for stock", "Current Location/Status",
     "Price Per Carat", "Price For stone", "CERTIFICATE LINK", "Comment",
     "Video URL", "Video Backup Drive Link",
+    "Certificate PDF Backup Drive Link",
     "Lab", "Status", "Notes", "date_added", "last_updated"
 ]
 
@@ -67,6 +68,7 @@ EDITABLE_COLUMNS = [
     "Production Order #, if for stock", "Current Location/Status",
     "Price Per Carat", "Price For stone", "Comment",
     "Video URL", "Video Backup Drive Link",
+    "Certificate PDF Backup Drive Link",
 ]
 
 SHEET_HEADERS = INVENTORY_COLUMNS  # same order written to Google Sheet
@@ -200,6 +202,7 @@ def row_to_db_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "comment": row.get("Comment") or "",
         "video_url": row.get("Video URL") or "",
         "video_backup_drive_link": row.get("Video Backup Drive Link") or "",
+        "certificate_pdf_backup_drive_link": row.get("Certificate PDF Backup Drive Link") or "",
         "lab": row.get("Lab") or "",
         "status": row.get("Status") or "",
         "notes": row.get("Notes") or "",
@@ -233,6 +236,7 @@ def db_dict_to_row(d: Dict[str, Any]) -> Dict[str, Any]:
         "Comment": d.get("comment"),
         "Video URL": d.get("video_url"),
         "Video Backup Drive Link": d.get("video_backup_drive_link"),
+        "Certificate PDF Backup Drive Link": d.get("certificate_pdf_backup_drive_link"),
         "Lab": d.get("lab"),
         "Status": d.get("status"),
         "Notes": d.get("notes"),
@@ -268,6 +272,7 @@ def _row_to_sheet_list(row: Dict[str, Any]) -> List[str]:
         "Comment": d["comment"],
         "Video URL": d["video_url"],
         "Video Backup Drive Link": d["video_backup_drive_link"],
+        "Certificate PDF Backup Drive Link": d["certificate_pdf_backup_drive_link"],
         "Lab": d["lab"],
         "Status": d["status"],
         "Notes": d["notes"],
@@ -846,6 +851,7 @@ def empty_inventory_row(cert: str = "", lab: str = "") -> Dict[str, Any]:
         "Comment": "",
         "Video URL": "",
         "Video Backup Drive Link": "",
+        "Certificate PDF Backup Drive Link": "",
         "Lab": lab,
         "Status": "Error",
         "Notes": "",
@@ -987,6 +993,135 @@ def save_video_urls(pairs: List[tuple], try_drive_backup: bool = True) -> List[D
     if to_upsert:
         upsert_rows(to_upsert)
     return results
+
+
+def resolve_certificate_pdf_url(cert: str, cert_link: str = "") -> Optional[str]:
+    """Build best-effort public PDF URL for a certificate."""
+    cert = str(cert or "").strip()
+    link = str(cert_link or "").strip()
+    if link and (".pdf" in link.lower() or "pdf.igi.org" in link.lower() or "pdf.gia.edu" in link.lower()):
+        return link
+    if is_igi(cert):
+        number_only = re.sub(r"^LG", "", cert, flags=re.I)
+        return f"https://pdf.igi.org/FDR{number_only}.pdf"
+    if link.startswith("http"):
+        return link
+    return None
+
+
+def download_certificate_pdf(cert: str, cert_link: str = "") -> Dict[str, Any]:
+    """Download certificate PDF bytes. Handles IGI FDR URLs and GIA token pages."""
+    url = resolve_certificate_pdf_url(cert, cert_link)
+    if not url:
+        return {"success": False, "error": "No PDF URL available for this certificate"}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/pdf,*/*",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=40, allow_redirects=True)
+        if resp.status_code == 404:
+            return {"success": False, "error": "PDF not found (404) on lab server"}
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}"}
+
+        content = resp.content
+        ct = (resp.headers.get("Content-Type") or "").lower()
+
+        # GIA token pages return HTML that redirects to S3 PDF
+        if "pdf" not in ct and content[:4] != b"%PDF":
+            html = content.decode("utf-8", errors="ignore")
+            m = re.search(r'https://[^"\']+\.pdf[^"\']*', html)
+            if not m:
+                m = re.search(r'window\.location\s*=\s*\(\s*["\'](https://[^"\']+)["\']', html)
+            if m:
+                pdf_url = m.group(1) if m.lastindex else m.group(0)
+                pdf_resp = requests.get(pdf_url, headers=headers, timeout=40)
+                if pdf_resp.status_code != 200 or pdf_resp.content[:4] != b"%PDF":
+                    return {"success": False, "error": "Could not download redirected PDF"}
+                content = pdf_resp.content
+            else:
+                return {"success": False, "error": "Response is not a PDF"}
+
+        if content[:4] != b"%PDF":
+            return {"success": False, "error": "Downloaded file is not a valid PDF"}
+
+        return {"success": True, "pdf_bytes": content, "source_url": url}
+    except Exception as e:
+        return {"success": False, "error": str(e)[:200]}
+
+
+def pdf_to_preview_images(pdf_bytes: bytes, max_pages: int = 2, scale: float = 1.5) -> List[Any]:
+    """Render PDF pages to PIL images for in-app preview."""
+    images = []
+    try:
+        import pypdfium2 as pdfium
+        from PIL import Image
+        doc = pdfium.PdfDocument(pdf_bytes)
+        n = min(len(doc), max_pages)
+        for i in range(n):
+            page = doc[i]
+            bitmap = page.render(scale=scale)
+            pil = bitmap.to_pil()
+            images.append(pil)
+        return images
+    except Exception:
+        pass
+    # Fallback: try pdfplumber + blank placeholder message via None
+    try:
+        import pdfplumber
+        from PIL import Image, ImageDraw, ImageFont
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for i, page in enumerate(pdf.pages[:max_pages]):
+                # pdfplumber can't always rasterize; draw text extract as fallback card
+                txt = (page.extract_text() or "")[:1200]
+                img = Image.new("RGB", (900, 1200), "white")
+                draw = ImageDraw.Draw(img)
+                y = 20
+                for line in txt.splitlines()[:50]:
+                    draw.text((20, y), line[:90], fill="black")
+                    y += 18
+                images.append(img)
+        return images
+    except Exception:
+        return []
+
+
+def upload_bytes_to_drive(filename: str, data: bytes, mime: str = "application/pdf") -> Dict[str, Any]:
+    """Upload raw bytes to configured Google Drive folder."""
+    if not _has_gdrive_folder():
+        return {"success": False, "error": "Drive folder_id not configured in secrets"}
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        folder_id = st.secrets["drive"]["folder_id"]
+        service = _get_drive_service()
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=True)
+        meta = {"name": filename, "parents": [folder_id]}
+        f = service.files().create(body=meta, media_body=media, fields="id,webViewLink").execute()
+        try:
+            service.permissions().create(
+                fileId=f["id"], body={"type": "anyone", "role": "reader"}
+            ).execute()
+        except Exception:
+            pass
+        link = f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view"
+        return {"success": True, "drive_link": link, "file_id": f["id"], "filename": filename}
+    except Exception as e:
+        return {"success": False, "error": str(e)[:200]}
+
+
+def backup_certificate_pdf_to_drive(cert: str, cert_link: str = "") -> Dict[str, Any]:
+    """Download lab PDF and store a permanent copy on Google Drive."""
+    dl = download_certificate_pdf(cert, cert_link)
+    if not dl.get("success"):
+        return {"success": False, "error": dl.get("error", "download failed")}
+    safe = re.sub(r"[^\w\-]", "_", str(cert))
+    filename = f"{safe}_certificate.pdf"
+    up = upload_bytes_to_drive(filename, dl["pdf_bytes"], "application/pdf")
+    if up.get("success"):
+        up["pdf_bytes"] = dl["pdf_bytes"]  # allow preview after backup
+    return up
 
 
 def fetch_igi_report(report_no: str) -> Dict[str, Any]:
@@ -1425,11 +1560,12 @@ with st.sidebar:
         st.caption("Add Google Sheet secrets for permanent storage")
 
 # ---------- Tabs ----------
-tab_add, tab_all, tab_edit, tab_video = st.tabs([
-    "➕ Add New Certificates",
-    "📋 All Inventory",
-    "✏️ Edit Editable Fields",
-    "🎬 Video Links & Backup",
+tab_add, tab_all, tab_edit, tab_video, tab_cert = st.tabs([
+    "➕ Add New",
+    "📋 Inventory",
+    "✏️ Edit",
+    "🎬 Videos",
+    "📄 Cert Preview",
 ])
 
 # =========================================================
@@ -1792,6 +1928,126 @@ folder_id = "FOLDER_ID_HERE"
 6. Reboot the app  
         """
     )
+
+# =========================================================
+# TAB 5 – Certificate PDF preview & Drive backup
+# =========================================================
+with tab_cert:
+    st.caption("Preview lab certificate PDFs and save a permanent copy to Google Drive.")
+    df_inv = load_all_inventory()
+
+    if df_inv.empty:
+        st.info("No certificates in inventory yet.")
+    else:
+        certs = df_inv["Certificate Number"].astype(str).tolist()
+        # Prefer ones without backup first in a helper list
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            selected = st.selectbox("Certificate", certs, key="cert_preview_select")
+        with col_b:
+            do_preview = st.button("👁 Preview", use_container_width=True)
+            do_backup = st.button("☁ Backup PDF to Drive", use_container_width=True, type="primary")
+
+        row = df_inv[df_inv["Certificate Number"].astype(str) == selected].iloc[0]
+        cert_link = str(row.get("CERTIFICATE LINK") or "")
+        existing_backup = str(row.get("Certificate PDF Backup Drive Link") or "").strip()
+
+        st.write(
+            f"**Lab:** {row.get('Lab', '')}  ·  "
+            f"**Shape:** {row.get('SHAPE AND CUT', '')}  ·  "
+            f"**{row.get('CARAT WEIGHT', '')}**  ·  "
+            f"{row.get('COLOR GRADE', '')} / {row.get('CLARITY GRADE', '')}"
+        )
+        if cert_link:
+            st.markdown(f"Source: [{cert_link[:80]}…]({cert_link})" if len(cert_link) > 80 else f"Source: [{cert_link}]({cert_link})")
+        if existing_backup:
+            st.success(f"Already backed up: [Open on Drive]({existing_backup})")
+
+        pdf_bytes_for_preview = None
+
+        if do_backup:
+            if not _has_gdrive_folder():
+                st.error("Configure `[drive] folder_id` in Streamlit secrets first.")
+            else:
+                with st.spinner("Downloading PDF & uploading to Drive..."):
+                    result = backup_certificate_pdf_to_drive(selected, cert_link)
+                if result.get("success"):
+                    # Save link on inventory row
+                    updated = row.to_dict()
+                    updated["Certificate PDF Backup Drive Link"] = result["drive_link"]
+                    upsert_rows([updated])
+                    st.success(f"Backed up → [Open on Drive]({result['drive_link']})")
+                    pdf_bytes_for_preview = result.get("pdf_bytes")
+                else:
+                    st.error(result.get("error", "Backup failed"))
+
+        if do_preview or pdf_bytes_for_preview is not None:
+            with st.spinner("Loading certificate preview..."):
+                if pdf_bytes_for_preview is None:
+                    dl = download_certificate_pdf(selected, cert_link)
+                    if not dl.get("success"):
+                        st.error(dl.get("error", "Could not load PDF"))
+                        dl = None
+                    else:
+                        pdf_bytes_for_preview = dl["pdf_bytes"]
+                if pdf_bytes_for_preview:
+                    images = pdf_to_preview_images(pdf_bytes_for_preview, max_pages=2, scale=1.6)
+                    if images:
+                        # Popup-like: show large images
+                        for idx, img in enumerate(images):
+                            st.image(img, caption=f"{selected} — page {idx+1}", use_container_width=True)
+                        # Also offer local PDF download
+                        st.download_button(
+                            "⬇ Download PDF",
+                            data=pdf_bytes_for_preview,
+                            file_name=f"{selected}_certificate.pdf",
+                            mime="application/pdf",
+                        )
+                    else:
+                        st.warning("PDF downloaded but could not render preview images. You can still backup/download the file.")
+                        st.download_button(
+                            "⬇ Download PDF",
+                            data=pdf_bytes_for_preview,
+                            file_name=f"{selected}_certificate.pdf",
+                            mime="application/pdf",
+                        )
+
+        st.divider()
+        st.markdown("**Batch backup** — save all IGI PDFs that are not yet on Drive")
+        if st.button("☁ Backup all missing certificate PDFs", key="batch_cert_backup"):
+            if not _has_gdrive_folder():
+                st.error("Drive folder not configured.")
+            else:
+                need = df_inv[
+                    (df_inv.get("Certificate PDF Backup Drive Link", pd.Series([""] * len(df_inv))).fillna("").astype(str).str.strip() == "")
+                ]
+                # Focus on IGI first (public PDFs)
+                if "Lab" in need.columns:
+                    need = need[need["Lab"].isin(["IGI", "GIA", ""])]
+                progress = st.progress(0)
+                ok, fail = 0, 0
+                logs = []
+                rows_to_save = []
+                total = len(need)
+                for i, (_, r) in enumerate(need.iterrows()):
+                    c = str(r["Certificate Number"])
+                    link = str(r.get("CERTIFICATE LINK") or "")
+                    res = backup_certificate_pdf_to_drive(c, link)
+                    if res.get("success"):
+                        ok += 1
+                        u = r.to_dict()
+                        u["Certificate PDF Backup Drive Link"] = res["drive_link"]
+                        rows_to_save.append(u)
+                        logs.append({"Certificate": c, "Status": "OK", "Link": res["drive_link"]})
+                    else:
+                        fail += 1
+                        logs.append({"Certificate": c, "Status": "Failed", "Link": res.get("error", "")})
+                    progress.progress((i + 1) / max(total, 1))
+                    time.sleep(0.3)
+                if rows_to_save:
+                    upsert_rows(rows_to_save)
+                st.success(f"Done — {ok} backed up, {fail} failed")
+                st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
 
 st.divider()
 st.caption("Data from official IGI PDFs / GIA Report Check. Inventory: Google Sheets when configured, else local SQLite.")
