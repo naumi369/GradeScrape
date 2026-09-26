@@ -1,19 +1,9 @@
 """
-IGI + GIA Diamond Inventory Manager - Streamlit App
-----------------------------------------------------
-Features:
-- Live fetch IGI / GIA reports
-- Full inventory column format
-- SQLite database – keeps growing as you add certificates
-- Tabs: Add New | All Inventory | Edit Editable Fields
-- Track how many certificates added today
-- Edit FGI Item #, prices, location, etc. and save
-
-How to run:
-    pip install streamlit pandas openpyxl requests pdfplumber pypdf
-    streamlit run igi_gia_report_lookup.py
+Certified Stone Inventory Application
+-------------------------------------
+Internal tool for certificate lookup, inventory management,
+and media reference for certified stones.
 """
-
 import streamlit as st
 import pandas as pd
 import requests
@@ -40,8 +30,8 @@ except ImportError:
     HAS_PLAYWRIGHT = False
 
 st.set_page_config(
-    page_title="IGI + GIA Inventory Manager",
-    page_icon="💎",
+    page_title="Certified Stone Inventory",
+    page_icon="◆",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -511,9 +501,9 @@ def load_all_inventory() -> pd.DataFrame:
             # Don't spam errors on quota – show once-friendly message
             msg = str(e)
             if "429" in msg or "Quota" in msg:
-                st.warning("Google Sheets quota hit – showing cached/empty data. Wait ~1 minute and refresh.")
+                st.warning("Data service is temporarily busy. Please try again shortly.")
             else:
-                st.error(f"Google Sheets read error: {e}")
+                st.error("Unable to load inventory data.")
             return pd.DataFrame(columns=INVENTORY_COLUMNS)
 
     conn = get_conn()
@@ -690,7 +680,7 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
     cert = str(cert or "").strip()
     if not cert:
         return
-    st.markdown(f"### 📄 {cert}")
+    st.markdown(f"### Certificate {cert}")
     existing = load_all_inventory()
     link = cert_link
     backup_link = ""
@@ -705,16 +695,20 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        do_backup = st.button("☁ Backup to Drive", key=f"prev_bak_{cert}", disabled=not _has_gdrive_folder())
+        do_backup = st.button(
+            "Save PDF copy",
+            key=f"prev_bak_{cert}",
+            disabled=not _has_gdrive_folder(),
+        )
     with c2:
-        st.button("🔄 Reload preview", key=f"prev_rel_{cert}")
+        st.button("Refresh", key=f"prev_rel_{cert}")
     with c3:
         if backup_link:
-            st.markdown(f"[Open Drive backup]({backup_link})")
+            st.markdown(f"[Open saved copy]({backup_link})")
 
     pdf_bytes = None
     if do_backup and _has_gdrive_folder():
-        with st.spinner("Backing up PDF…"):
+        with st.spinner("Saving certificate…"):
             res = backup_certificate_pdf_to_drive(cert, link)
         if res.get("success"):
             row = match_row or empty_inventory_row(cert, infer_lab(cert))
@@ -723,28 +717,25 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
             if link:
                 row["CERTIFICATE LINK"] = link
             upsert_rows([row])
-            st.success("Saved to Drive")
+            st.success("Certificate copy saved.")
             pdf_bytes = res.get("pdf_bytes")
-            backup_link = res["drive_link"]
         else:
-            st.error(res.get("error", "Backup failed"))
+            st.error(res.get("error", "Unable to save certificate copy."))
 
     if pdf_bytes is None:
-        with st.spinner("Loading certificate PDF…"):
+        with st.spinner("Loading certificate…"):
             dl = download_certificate_pdf(cert, link)
         if not dl.get("success"):
-            st.warning(dl.get("error", "Could not load PDF for preview"))
+            st.warning(dl.get("error", "Certificate file is not available."))
             return
         pdf_bytes = dl["pdf_bytes"]
 
     images = pdf_to_preview_images(pdf_bytes, max_pages=2, scale=1.5)
     if images:
         for i, img in enumerate(images):
-            st.image(img, caption=f"Page {i+1}", use_container_width=True)
-    else:
-        st.info("PDF loaded but image render failed — download below.")
+            st.image(img, caption=f"Page {i + 1}", use_container_width=True)
     st.download_button(
-        "⬇ Download PDF",
+        "Download PDF",
         data=pdf_bytes,
         file_name=f"{cert}_certificate.pdf",
         mime="application/pdf",
@@ -1256,7 +1247,7 @@ def fetch_igi_report(report_no: str) -> Dict[str, Any]:
 
         if resp.status_code == 404:
             result["Status"] = "Not Found"
-            result["Notes"] = "PDF not public yet – open Verify on igi.org and fill grades in Edit tab"
+            result["Notes"] = "Certificate PDF not available from laboratory at this time"
             result["CERTIFICATE LINK"] = f"https://www.igi.org/Verify-Your-Report/?r={cert}"
             return result
         if resp.status_code != 200:
@@ -1528,11 +1519,11 @@ def fetch_gia_info(report_no: str, try_playwright: bool = False) -> Dict[str, An
     result["DESCRIPTION"] = "NATURAL DIAMOND"
     result["CERTIFICATE LINK"] = f"https://www.gia.edu/report-check?reportno={report_no}"
     result["Status"] = "Link Ready"
-    result["Notes"] = "See clickable links below the table"
+    result["Notes"] = "Open laboratory report check link"
 
     if not try_playwright or not HAS_PLAYWRIGHT:
         if try_playwright and not HAS_PLAYWRIGHT:
-            result["Notes"] = "Playwright not installed – see links below"
+            result["Notes"] = "Open laboratory report check link"
         return result
 
     url = f"https://www.gia.edu/report-check?reportno={report_no}"
@@ -1633,13 +1624,12 @@ def fetch_gia_info(report_no: str, try_playwright: bool = False) -> Dict[str, An
 # Streamlit UI
 # -------------------------------------------------
 
-st.title("💎 IGI + GIA Inventory Manager")
-st.caption("Live report lookup + persistent inventory database")
+st.title("Certified Stone Inventory")
+st.caption("Centralized inventory · Certificate lookup · Media reference")
 
 # Sidebar
 with st.sidebar:
-    st.header("📊 Inventory Stats")
-    # Single load for both metrics (uses cache)
+    st.subheader("Summary")
     _stats_df = load_all_inventory()
     st.metric("Total certificates", len(_stats_df))
     _today = date.today().isoformat()
@@ -1648,55 +1638,35 @@ with st.sidebar:
         _added_today = int(_stats_df["date_added"].astype(str).str.startswith(_today).sum())
     st.metric("Added today", _added_today)
     st.divider()
-    st.header("Settings")
-    use_playwright = st.toggle(
-        "Try Playwright for GIA (experimental)",
-        value=False,
-        help="Usually blocked by GIA. Keep OFF."
-    )
-    st.markdown(
-        """
-        **Tips**
-        - IGI: `LG831649004`
-        - GIA number or `GIA# 123...`
-        - GIA token: full `pdf.gia.edu` link
-        - Editable fields are saved when you click **Save**
-        """
-    )
-    st.divider()
+    use_playwright = False  # reserved for internal GIA automation
     if use_gsheets():
-        st.success("Storage: Google Sheets (persistent)")
+        st.caption("Connected data store")
     else:
-        st.warning("Storage: local SQLite (cleared on sleep)")
-        st.caption("Add Google Sheet secrets for permanent storage")
+        st.caption("Local data store")
 
 # ---------- Tabs ----------
 tab_add, tab_all, tab_edit, tab_video = st.tabs([
-    "➕ Add New",
-    "📋 Inventory",
-    "✏️ Edit",
-    "🎬 Videos",
+    "Add certificates",
+    "Inventory",
+    "Edit records",
+    "Media links",
 ])
 
 # =========================================================
 # TAB 1 – Add new certificates
 # =========================================================
 with tab_add:
-    st.subheader("Fetch & add certificates")
-    default_example = """LG831649004
-LG833663017
-LG834619611"""
     report_text = st.text_area(
-        "Report numbers or GIA PDF token links (one per line)",
-        value=default_example,
+        "Certificate numbers",
+        value="",
         height=160,
-        help="Mix IGI numbers, GIA numbers, and special GIA PDF token links"
+        placeholder="Enter one certificate number per line (IGI or GIA)",
     )
     col1, col2 = st.columns([1, 1])
     with col1:
-        fetch_btn = st.button("🔍 Fetch & Save to Inventory", type="primary", use_container_width=True)
+        fetch_btn = st.button("Fetch & save", type="primary", use_container_width=True)
     with col2:
-        clear_btn = st.button("Clear input", use_container_width=True)
+        clear_btn = st.button("Clear", use_container_width=True)
 
     if clear_btn:
         st.rerun()
@@ -1717,14 +1687,13 @@ LG834619611"""
                     seen.add(cleaned)
                     items_to_process.append(("number", cleaned))
 
-        st.info(f"Processing **{len(items_to_process)}** unique item(s)...")
         progress = st.progress(0)
         status_text = st.empty()
         results = []
 
         for i, (item_type, value) in enumerate(items_to_process):
             display = value if len(value) < 60 else value[:50] + "..."
-            status_text.text(f"Looking up {display} ({i+1}/{len(items_to_process)})...")
+            status_text.text(f"Retrieving {display} ({i+1}/{len(items_to_process)})")
             progress.progress((i + 1) / len(items_to_process))
 
             if item_type == "token":
@@ -1747,24 +1716,17 @@ LG834619611"""
         to_save = [r for r in results if r.get("Status") not in ("Unknown Format", "Error")]
         if to_save:
             upsert_rows(to_save)
-            not_found = sum(1 for r in to_save if r.get("Status") == "Not Found")
-            msg = f"Saved **{len(to_save)}** certificate(s) to inventory database."
-            if not_found:
-                msg += f" ({not_found} without public PDF – fill grades in Edit tab)"
-            st.success(msg)
+            st.success(f"{len(to_save)} record(s) saved to inventory.")
 
         df_new = pd.DataFrame(results)
         inv_cols = [c for c in INVENTORY_COLUMNS if c in df_new.columns]
         df_new = df_new[inv_cols]
 
-        st.subheader("Just added / fetched (this session)")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Processed", len(df_new))
         m2.metric("IGI", len(df_new[df_new["Lab"] == "IGI"]) if "Lab" in df_new.columns else 0)
         m3.metric("GIA", len(df_new[df_new["Lab"] == "GIA"]) if "Lab" in df_new.columns else 0)
-        m4.metric("Added today (total)", count_added_today())
-
-        st.caption("Click a row to preview certificate")
+        m4.metric("Added today", count_added_today())
         try:
             ev_new = st.dataframe(
                 df_new, use_container_width=True, hide_index=True,
@@ -1786,7 +1748,7 @@ LG834619611"""
             export = df_new.drop(columns=[c for c in ["Lab", "Status", "Notes", "date_added", "last_updated"] if c in df_new.columns], errors="ignore")
             export.to_excel(writer, index=False, sheet_name="Batch")
         st.download_button(
-            "📥 Download this batch (Excel)",
+            "Export Excel",
             data=buffer.getvalue(),
             file_name=f"Batch_{date.today().isoformat()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1804,7 +1766,7 @@ with tab_all:
         search_q = st.text_input(
             "Search",
             value="",
-            placeholder="🔍  2 CT Oval VS2  ·  E pear  ·  CVD  ·  LG831",
+            placeholder="Search by certificate, shape, color, clarity, carat…",
             label_visibility="collapsed",
             key="inventory_search",
         )
@@ -1926,10 +1888,8 @@ with tab_all:
         view = smart_filter(view, search_q)
 
     render_inventory_subtotals(view, title=f"{len(view)}/{len(df_all)} shown")
-    st.caption("Click a **row** to preview that certificate PDF")
-
     if view.empty:
-        st.info("No rows to show.")
+        st.info("No matching records.")
     else:
         try:
             event = st.dataframe(
@@ -1978,7 +1938,7 @@ with tab_all:
             export = view.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns], errors="ignore")
             export.to_excel(writer, index=False, sheet_name="Inventory")
         st.download_button(
-            "📥 Excel",
+            "Export Excel",
             data=buffer.getvalue(),
             file_name="Filtered_Inventory.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1990,7 +1950,7 @@ with tab_all:
 with tab_edit:
     df_all = load_all_inventory()
     if df_all.empty:
-        st.info("No certificates yet — add some in **Add New**.")
+        st.info("No inventory records available.")
     else:
         render_inventory_subtotals(df_all, title="inventory")
 
@@ -2001,7 +1961,7 @@ with tab_edit:
         edit_cols = [c for c in edit_cols if c in df_all.columns]
         df_edit = df_all[edit_cols].copy()
 
-        st.caption("Select a row below, or pick a certificate to preview")
+        
         try:
             event_e = st.dataframe(
                 df_edit,
@@ -2037,9 +1997,9 @@ with tab_edit:
 
         b1, b2, b3 = st.columns([1, 2, 2])
         with b1:
-            if st.button("💾 Save", type="primary", use_container_width=True):
+            if st.button("Save", type="primary", use_container_width=True):
                 update_editable_fields(edited)
-                st.success("Saved.")
+                st.success("Changes saved.")
                 st.rerun()
         with b2:
             pick_e = st.selectbox(
@@ -2049,7 +2009,7 @@ with tab_edit:
                 label_visibility="collapsed",
             )
         with b3:
-            if st.button("👁 Preview", use_container_width=True, key="edit_preview_btn"):
+            if st.button("Preview", use_container_width=True, key="edit_preview_btn"):
                 open_certificate_preview(pick_e, "")
 
         if not HAS_DIALOG and st.session_state.get("inline_preview_cert"):
@@ -2063,73 +2023,33 @@ with tab_edit:
 # TAB 4 – Video links & Drive backup
 # =========================================================
 with tab_video:
-    st.subheader("Video links & Google Drive backup")
-    st.markdown(
-        """
-        Paste pairs: **certificate number** and **video URL** (tab or space separated, one per line).
-
-        - All links are saved to inventory (**Video URL** column)
-        - **Direct video files** (mp4/webm) are also uploaded to your Google Drive folder
-        - Vision360 / DNA / HTML viewers are saved as links only (not a single downloadable file)
-        """
-    )
-
-    if _has_gdrive_folder():
-        st.success("Google Drive folder configured – direct videos will be backed up.")
-    else:
-        st.warning("Drive folder not configured yet – links will still be saved to Sheets. See setup steps below.")
-
-    example_videos = """1563160638	https://nivoda-inhousemedia.s3.amazonaws.com/inhouse-360-1563160638
-2566010524	https://vidpicture.com/show_video.asp?Source=Version_5.0&Stock_ID=713357&video=v360
-3535734963	https://diaassets.blob.core.windows.net/dim/hd/Vision360.html?d=B479-77-A"""
     video_text = st.text_area(
-        "Certificate + Video URL (one per line)",
-        value=example_videos,
-        height=200,
+        "Certificate number and media URL",
+        value="",
+        height=180,
+        placeholder="One pair per line: certificate number, then URL (tab or space separated)",
         key="video_bulk_input",
     )
-    try_backup = st.checkbox("Try Google Drive backup for direct video files", value=True)
+    try_backup = st.checkbox("Upload direct video files to linked storage", value=False)
 
-    if st.button("💾 Save video links", type="primary", key="save_videos_btn"):
+    if st.button("Save media links", type="primary", key="save_videos_btn"):
         pairs = []
         for line in video_text.strip().splitlines():
             line = line.strip()
             if not line:
                 continue
-            # Split on tab or multiple spaces
             parts = re.split(r"\s+", line, maxsplit=1)
             if len(parts) < 2:
-                st.warning(f"Skipped (need cert + URL): {line[:60]}")
                 continue
             pairs.append((parts[0], parts[1]))
 
         if not pairs:
-            st.error("No valid pairs found.")
+            st.error("No valid certificate / URL pairs found.")
         else:
-            with st.spinner(f"Processing {len(pairs)} video link(s)..."):
+            with st.spinner("Saving…"):
                 results = save_video_urls(pairs, try_drive_backup=try_backup)
-            st.success(f"Processed {len(results)} link(s).")
+            st.success(f"{len(results)} media link(s) saved.")
             st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.markdown("### Setup Google Drive folder (one-time)")
-    st.markdown(
-        """
-1. Enable **Google Drive API** in the same Google Cloud project  
-2. In Google Drive, create a folder e.g. `IGI Video Backups`  
-3. Share that folder with your service account **client_email** as **Editor**  
-4. Copy the folder ID from the URL:
-   `https://drive.google.com/drive/folders/FOLDER_ID_HERE`  
-5. Add to Streamlit secrets:
-
-```toml
-[drive]
-folder_id = "FOLDER_ID_HERE"
-```
-
-6. Reboot the app  
-        """
-    )
-
 st.divider()
-st.caption("Data from official IGI PDFs / GIA Report Check. Inventory: Google Sheets when configured, else local SQLite.")
+st.caption("Certified Stone Inventory · FGI")
