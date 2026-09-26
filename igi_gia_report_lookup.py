@@ -1183,34 +1183,56 @@ def upload_bytes_to_drive(filename: str, data: bytes, mime: str = "application/p
         return {"success": False, "error": "Drive folder_id not configured in secrets"}
     try:
         from googleapiclient.http import MediaIoBaseUpload
-        folder_id = st.secrets["drive"]["folder_id"]
+        folder_id = str(st.secrets["drive"]["folder_id"]).strip()
+        if not folder_id:
+            return {"success": False, "error": "drive.folder_id is empty in secrets"}
         service = _get_drive_service()
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=True)
         meta = {"name": filename, "parents": [folder_id]}
-        f = service.files().create(body=meta, media_body=media, fields="id,webViewLink").execute()
+        f = (
+            service.files()
+            .create(
+                body=meta,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
         try:
             service.permissions().create(
-                fileId=f["id"], body={"type": "anyone", "role": "reader"}
+                fileId=f["id"],
+                body={"type": "anyone", "role": "reader"},
+                supportsAllDrives=True,
             ).execute()
         except Exception:
             pass
         link = f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view"
         return {"success": True, "drive_link": link, "file_id": f["id"], "filename": filename}
     except Exception as e:
-        return {"success": False, "error": str(e)[:200]}
+        err = str(e)
+        # Common causes
+        if "File not found" in err or "404" in err:
+            err += " — Check folder_id and that the folder is shared with the service account as Editor."
+        if "googleapiclient" in err or "No module" in err:
+            err += " — Add google-api-python-client to requirements.txt and reboot the app."
+        return {"success": False, "error": err[:400]}
 
 
 def backup_certificate_pdf_to_drive(cert: str, cert_link: str = "") -> Dict[str, Any]:
     """Download lab PDF and store a permanent copy on Google Drive."""
-    dl = download_certificate_pdf(cert, cert_link)
-    if not dl.get("success"):
-        return {"success": False, "error": dl.get("error", "download failed")}
-    safe = re.sub(r"[^\w\-]", "_", str(cert))
-    filename = f"{safe}_certificate.pdf"
-    up = upload_bytes_to_drive(filename, dl["pdf_bytes"], "application/pdf")
-    if up.get("success"):
-        up["pdf_bytes"] = dl["pdf_bytes"]  # allow preview after backup
-    return up
+    try:
+        dl = download_certificate_pdf(cert, cert_link)
+        if not dl.get("success"):
+            return {"success": False, "error": f"Download failed: {dl.get('error', 'unknown')}"}
+        safe = re.sub(r"[^\w\-]", "_", str(cert))
+        filename = f"{safe}_certificate.pdf"
+        up = upload_bytes_to_drive(filename, dl["pdf_bytes"], "application/pdf")
+        if up.get("success"):
+            up["pdf_bytes"] = dl["pdf_bytes"]
+        return up
+    except Exception as e:
+        return {"success": False, "error": f"Backup error: {str(e)[:300]}"}
 
 
 def fetch_igi_report(report_no: str) -> Dict[str, Any]:
@@ -1649,12 +1671,11 @@ with st.sidebar:
         st.caption("Add Google Sheet secrets for permanent storage")
 
 # ---------- Tabs ----------
-tab_add, tab_all, tab_edit, tab_video, tab_cert = st.tabs([
+tab_add, tab_all, tab_edit, tab_video = st.tabs([
     "➕ Add New",
     "📋 Inventory",
     "✏️ Edit",
     "🎬 Videos",
-    "📄 Cert Preview",
 ])
 
 # =========================================================
@@ -1793,30 +1814,30 @@ with tab_all:
         filter_today = st.checkbox("Today only", value=False, key="today_filter")
 
     def smart_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
-        """Filter inventory using natural-ish phrases like '2 CT Oval VS2' or 'emerald 2ct'."""
+        """Filter with partial keywords, cert fragments, shape/color/clarity/carat."""
         if df.empty or not query or not query.strip():
             return df
 
         q = query.strip().upper()
         mask = pd.Series([True] * len(df), index=df.index)
+        search_cols = [
+            c for c in [
+                "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE",
+                "CLARITY GRADE", "Process", "FGI Item Number", "Current Location/Status",
+                "For stock or Customer", "Comment", "DESCRIPTION", "Lab",
+                "Production Order #, if for stock",
+            ] if c in df.columns
+        ]
 
-        # Certificate number fragment
-        cert_hits = re.findall(r"\bLG?\d{6,}\b", q)
-        for c in cert_hits:
-            col = df["Certificate Number"].astype(str).str.upper()
-            mask &= col.str.contains(c, na=False)
-
-        # Carat: "2 CT", "2CT", "2.5 carat", "2ct"
+        # --- Structured filters (AND) ---
         carat_m = re.search(r"(\d+\.?\d*)\s*(?:CT|CARAT|CTS|CARATS)\b", q)
         if carat_m and "CARAT WEIGHT" in df.columns:
             target = float(carat_m.group(1))
-            # Whole number (e.g. 2ct) → match 2.00–2.99; decimal → tight tolerance
             is_whole = abs(target - round(target)) < 1e-9
 
             def _near_carat(val):
                 try:
-                    s = str(val).upper()
-                    num = float(re.search(r"[\d.]+", s).group())
+                    num = float(re.search(r"[\d.]+", str(val).upper()).group())
                     if is_whole:
                         return target <= num < target + 1.0
                     return abs(num - target) <= 0.12
@@ -1825,7 +1846,6 @@ with tab_all:
 
             mask &= df["CARAT WEIGHT"].apply(_near_carat)
 
-        # Shape keywords
         shapes = [
             "ROUND", "OVAL", "PEAR", "MARQUISE", "PRINCESS", "CUSHION",
             "EMERALD", "RADIANT", "HEART", "ASSCHER", "RECTANGULAR", "SQUARE",
@@ -1835,13 +1855,11 @@ with tab_all:
             if re.search(rf"\b{shape}\b", q) and "SHAPE AND CUT" in df.columns:
                 mask &= df["SHAPE AND CUT"].astype(str).str.upper().str.contains(shape, na=False)
 
-        # Color: "E color", "color E", or explicit "COLOR E"
         color_m2 = re.search(r"(?:COLOR|COLOUR)\s*([D-Z])\b|\b([D-Z])\s*(?:COLOR|COLOUR)\b", q)
         if color_m2 and "COLOR GRADE" in df.columns:
             letter = color_m2.group(1) or color_m2.group(2)
             mask &= df["COLOR GRADE"].astype(str).str.upper() == letter
 
-        # Clarity
         clar_m = re.search(
             r"\b(FL|IF|VVS\s*1|VVS\s*2|VVS1|VVS2|VS\s*1|VS\s*2|VS1|VS2|"
             r"SI\s*1|SI\s*2|SI1|SI2|I\s*1|I\s*2|I\s*3|I1|I2|I3)\b",
@@ -1851,44 +1869,50 @@ with tab_all:
             clar = re.sub(r"\s+", "", clar_m.group(1)).upper()
             mask &= df["CLARITY GRADE"].astype(str).str.upper().str.replace(" ", "", regex=False) == clar
 
-        # Process
         if re.search(r"\bCVD\b", q) and "Process" in df.columns:
             mask &= df["Process"].astype(str).str.upper().str.contains("CVD", na=False)
         if re.search(r"\bHPHT\b", q) and "Process" in df.columns:
             mask &= df["Process"].astype(str).str.upper().str.contains("HPHT", na=False)
 
-        # Free-text tokens (location, FGI item, comments) — skip already-handled tokens
-        tokens = re.findall(r"[A-Z0-9.]{2,}", q)
+        # --- Partial keyword / cert fragment tokens (AND across tokens) ---
+        tokens = re.findall(r"[A-Z0-9]{2,}", q)
         skip = {
             "CT", "CARAT", "CARATS", "CTS", "SHOW", "ME", "IN", "THE", "WITH", "AND",
-            "COLOR", "COLOUR", "CLARITY", "SHAPE", "CUT", "GRADE",
+            "COLOR", "COLOUR", "CLARITY", "SHAPE", "CUT", "GRADE", "CVD", "HPHT",
         }
+        skip |= set(shapes)
         for tok in tokens:
             if tok in skip:
                 continue
-            # Skip pure numbers and carat-like tokens (2CT, 2.5CT)
-            if re.match(r"^\d+\.?\d*$", tok):
-                continue
             if re.match(r"^\d+\.?\d*(CT|CARAT|CTS|CARATS)$", tok):
-                continue
-            if tok in shapes or tok in ("CVD", "HPHT"):
                 continue
             if re.match(r"^(FL|IF|VVS[12]?|VS[12]?|SI[12]?|I[123]?)$", tok):
                 continue
-            if len(tok) == 1 and tok.isalpha():
+            # Digit-only or short cert-like → prefer certificate number partial match
+            if re.match(r"^\d{3,}$", tok) or (tok.startswith("LG") and len(tok) >= 4):
+                if "Certificate Number" in df.columns:
+                    mask &= df["Certificate Number"].astype(str).str.upper().str.contains(
+                        re.escape(tok), na=False
+                    )
                 continue
-            cols = [
-                c for c in [
-                    "Certificate Number", "SHAPE AND CUT", "FGI Item Number",
-                    "Current Location/Status", "For stock or Customer",
-                    "Comment", "DESCRIPTION",
-                ] if c in df.columns
-            ]
-            if cols:
+            # General partial: token must appear in any searchable column
+            if search_cols:
                 sub = pd.Series([False] * len(df), index=df.index)
-                for c in cols:
+                for c in search_cols:
                     sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
                 mask &= sub
+
+        # If query is a single short fragment with no structured hit, still partial-search all
+        if len(tokens) == 1 and tokens[0] not in skip and search_cols:
+            tok = tokens[0]
+            if not (
+                carat_m or color_m2 or clar_m
+                or any(re.search(rf"\b{s}\b", q) for s in shapes)
+            ):
+                sub = pd.Series([False] * len(df), index=df.index)
+                for c in search_cols:
+                    sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
+                mask = sub
 
         return df[mask]
 
@@ -2106,126 +2130,6 @@ folder_id = "FOLDER_ID_HERE"
 6. Reboot the app  
         """
     )
-
-# =========================================================
-# TAB 5 – Certificate PDF preview & Drive backup
-# =========================================================
-with tab_cert:
-    st.caption("Preview lab certificate PDFs and save a permanent copy to Google Drive.")
-    df_inv = load_all_inventory()
-
-    if df_inv.empty:
-        st.info("No certificates in inventory yet.")
-    else:
-        certs = df_inv["Certificate Number"].astype(str).tolist()
-        # Prefer ones without backup first in a helper list
-        col_a, col_b = st.columns([2, 1])
-        with col_a:
-            selected = st.selectbox("Certificate", certs, key="cert_preview_select")
-        with col_b:
-            do_preview = st.button("👁 Preview", use_container_width=True)
-            do_backup = st.button("☁ Backup PDF to Drive", use_container_width=True, type="primary")
-
-        row = df_inv[df_inv["Certificate Number"].astype(str) == selected].iloc[0]
-        cert_link = str(row.get("CERTIFICATE LINK") or "")
-        existing_backup = str(row.get("Certificate PDF Backup Drive Link") or "").strip()
-
-        st.write(
-            f"**Lab:** {row.get('Lab', '')}  ·  "
-            f"**Shape:** {row.get('SHAPE AND CUT', '')}  ·  "
-            f"**{row.get('CARAT WEIGHT', '')}**  ·  "
-            f"{row.get('COLOR GRADE', '')} / {row.get('CLARITY GRADE', '')}"
-        )
-        if cert_link:
-            st.markdown(f"Source: [{cert_link[:80]}…]({cert_link})" if len(cert_link) > 80 else f"Source: [{cert_link}]({cert_link})")
-        if existing_backup:
-            st.success(f"Already backed up: [Open on Drive]({existing_backup})")
-
-        pdf_bytes_for_preview = None
-
-        if do_backup:
-            if not _has_gdrive_folder():
-                st.error("Configure `[drive] folder_id` in Streamlit secrets first.")
-            else:
-                with st.spinner("Downloading PDF & uploading to Drive..."):
-                    result = backup_certificate_pdf_to_drive(selected, cert_link)
-                if result.get("success"):
-                    # Save link on inventory row
-                    updated = row.to_dict()
-                    updated["Certificate PDF Backup Drive Link"] = result["drive_link"]
-                    upsert_rows([updated])
-                    st.success(f"Backed up → [Open on Drive]({result['drive_link']})")
-                    pdf_bytes_for_preview = result.get("pdf_bytes")
-                else:
-                    st.error(result.get("error", "Backup failed"))
-
-        if do_preview or pdf_bytes_for_preview is not None:
-            with st.spinner("Loading certificate preview..."):
-                if pdf_bytes_for_preview is None:
-                    dl = download_certificate_pdf(selected, cert_link)
-                    if not dl.get("success"):
-                        st.error(dl.get("error", "Could not load PDF"))
-                        dl = None
-                    else:
-                        pdf_bytes_for_preview = dl["pdf_bytes"]
-                if pdf_bytes_for_preview:
-                    images = pdf_to_preview_images(pdf_bytes_for_preview, max_pages=2, scale=1.6)
-                    if images:
-                        # Popup-like: show large images
-                        for idx, img in enumerate(images):
-                            st.image(img, caption=f"{selected} — page {idx+1}", use_container_width=True)
-                        # Also offer local PDF download
-                        st.download_button(
-                            "⬇ Download PDF",
-                            data=pdf_bytes_for_preview,
-                            file_name=f"{selected}_certificate.pdf",
-                            mime="application/pdf",
-                        )
-                    else:
-                        st.warning("PDF downloaded but could not render preview images. You can still backup/download the file.")
-                        st.download_button(
-                            "⬇ Download PDF",
-                            data=pdf_bytes_for_preview,
-                            file_name=f"{selected}_certificate.pdf",
-                            mime="application/pdf",
-                        )
-
-        st.divider()
-        st.markdown("**Batch backup** — save all IGI PDFs that are not yet on Drive")
-        if st.button("☁ Backup all missing certificate PDFs", key="batch_cert_backup"):
-            if not _has_gdrive_folder():
-                st.error("Drive folder not configured.")
-            else:
-                need = df_inv[
-                    (df_inv.get("Certificate PDF Backup Drive Link", pd.Series([""] * len(df_inv))).fillna("").astype(str).str.strip() == "")
-                ]
-                # Focus on IGI first (public PDFs)
-                if "Lab" in need.columns:
-                    need = need[need["Lab"].isin(["IGI", "GIA", ""])]
-                progress = st.progress(0)
-                ok, fail = 0, 0
-                logs = []
-                rows_to_save = []
-                total = len(need)
-                for i, (_, r) in enumerate(need.iterrows()):
-                    c = str(r["Certificate Number"])
-                    link = str(r.get("CERTIFICATE LINK") or "")
-                    res = backup_certificate_pdf_to_drive(c, link)
-                    if res.get("success"):
-                        ok += 1
-                        u = r.to_dict()
-                        u["Certificate PDF Backup Drive Link"] = res["drive_link"]
-                        rows_to_save.append(u)
-                        logs.append({"Certificate": c, "Status": "OK", "Link": res["drive_link"]})
-                    else:
-                        fail += 1
-                        logs.append({"Certificate": c, "Status": "Failed", "Link": res.get("error", "")})
-                    progress.progress((i + 1) / max(total, 1))
-                    time.sleep(0.3)
-                if rows_to_save:
-                    upsert_rows(rows_to_save)
-                st.success(f"Done — {ok} backed up, {fail} failed")
-                st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
 
 st.divider()
 st.caption("Data from official IGI PDFs / GIA Report Check. Inventory: Google Sheets when configured, else local SQLite.")
