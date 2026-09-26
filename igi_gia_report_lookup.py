@@ -1952,8 +1952,7 @@ with tab_edit:
     if df_all.empty:
         st.info("No inventory records available.")
     else:
-        render_inventory_subtotals(df_all, title="inventory")
-
+        # Single editable table only (no second grid)
         edit_cols = [
             "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT",
             "COLOR GRADE", "CLARITY GRADE",
@@ -1961,59 +1960,45 @@ with tab_edit:
         edit_cols = [c for c in edit_cols if c in df_all.columns]
         df_edit = df_all[edit_cols].copy()
 
-        
-        try:
-            event_e = st.dataframe(
-                df_edit,
-                use_container_width=True,
-                hide_index=True,
-                height=200,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="edit_table_select",
+        b1, b2, b3 = st.columns([1, 3, 1])
+        with b1:
+            save_clicked = st.button("Save", type="primary", use_container_width=True)
+        with b2:
+            pick_e = st.selectbox(
+                "Preview",
+                df_edit["Certificate Number"].astype(str).tolist(),
+                key="edit_preview_pick",
+                label_visibility="collapsed",
             )
-            sel_e = event_e.selection.rows if event_e and event_e.selection else []
-            if sel_e and sel_e[0] < len(df_edit):
-                crow = df_edit.iloc[sel_e[0]]
-                open_certificate_preview(str(crow.get("Certificate Number", "")), "")
-        except TypeError:
-            pass
+        with b3:
+            preview_clicked = st.button("Preview", use_container_width=True, key="edit_preview_btn")
 
         edited = st.data_editor(
             df_edit,
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
-            height=400,
+            height=560,
             key="inventory_editor",
             column_config={
                 "Certificate Number": st.column_config.TextColumn(disabled=True, width="small"),
-                "SHAPE AND CUT": st.column_config.TextColumn(disabled=True, width="small"),
+                "SHAPE AND CUT": st.column_config.TextColumn(disabled=True, width="medium"),
                 "CARAT WEIGHT": st.column_config.TextColumn(disabled=True, width="small"),
                 "COLOR GRADE": st.column_config.TextColumn(disabled=True, width="small"),
                 "CLARITY GRADE": st.column_config.TextColumn(disabled=True, width="small"),
             },
         )
 
-        b1, b2, b3 = st.columns([1, 2, 2])
-        with b1:
-            if st.button("Save", type="primary", use_container_width=True):
-                update_editable_fields(edited)
-                st.success("Changes saved.")
-                st.rerun()
-        with b2:
-            pick_e = st.selectbox(
-                "Preview cert",
-                edited["Certificate Number"].astype(str).tolist(),
-                key="edit_preview_pick",
-                label_visibility="collapsed",
-            )
-        with b3:
-            if st.button("Preview", use_container_width=True, key="edit_preview_btn"):
-                open_certificate_preview(pick_e, "")
+        if save_clicked:
+            update_editable_fields(edited)
+            st.success("Changes saved.")
+            st.rerun()
+
+        if preview_clicked:
+            open_certificate_preview(pick_e, "")
 
         if not HAS_DIALOG and st.session_state.get("inline_preview_cert"):
-            with st.expander(f"Preview: {st.session_state['inline_preview_cert']}", expanded=True):
+            with st.expander(f"Certificate {st.session_state['inline_preview_cert']}", expanded=True):
                 render_certificate_preview(
                     st.session_state["inline_preview_cert"],
                     st.session_state.get("inline_preview_link", ""),
