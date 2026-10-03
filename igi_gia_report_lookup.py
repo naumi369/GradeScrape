@@ -36,6 +36,94 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Professional UI theme (option 4: list + detail)
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [class*="css"]  { font-family: 'Inter', system-ui, sans-serif; }
+    .stApp { background-color: #F5F7FA; }
+    [data-testid="stSidebar"] {
+        background-color: #FFFFFF;
+        border-right: 1px solid #E5E7EB;
+    }
+    [data-testid="stSidebar"] .stMarkdown { color: #0B1F3A; }
+    h1 { color: #0B1F3A !important; font-weight: 700 !important; letter-spacing: -0.02em; }
+    h2, h3 { color: #0B1F3A !important; }
+    div[data-testid="stMetric"] {
+        background: #FFFFFF;
+        border: 1px solid #E5E7EB;
+        border-radius: 10px;
+        padding: 12px 14px;
+    }
+    div[data-testid="stMetric"] label { color: #6B7280 !important; }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #0B1F3A !important; }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background: transparent;
+        border-bottom: 1px solid #E5E7EB;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 0;
+        color: #6B7280;
+        font-weight: 500;
+    }
+    .stTabs [aria-selected="true"] {
+        color: #0B1F3A !important;
+        border-bottom: 2px solid #0D9488 !important;
+    }
+    .stButton > button[kind="primary"] {
+        background-color: #0B1F3A;
+        border-color: #0B1F3A;
+        border-radius: 8px;
+        font-weight: 600;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background-color: #0D9488;
+        border-color: #0D9488;
+    }
+    .stButton > button {
+        border-radius: 8px;
+    }
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #E5E7EB;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #FFFFFF;
+    }
+    .detail-panel {
+        background: #FFFFFF;
+        border: 1px solid #E5E7EB;
+        border-radius: 12px;
+        padding: 18px 20px;
+        min-height: 520px;
+    }
+    .detail-panel h3 {
+        margin-top: 0;
+        font-size: 1.05rem;
+        color: #0B1F3A;
+    }
+    .detail-kv {
+        display: grid;
+        grid-template-columns: 120px 1fr;
+        gap: 6px 12px;
+        font-size: 0.92rem;
+        margin: 12px 0 16px 0;
+    }
+    .detail-kv .k { color: #6B7280; }
+    .detail-kv .v { color: #0B1F3A; font-weight: 500; }
+    .app-footer {
+        text-align: center;
+        color: #9CA3AF;
+        font-size: 0.8rem;
+        padding: 18px 0 8px 0;
+    }
+    header[data-testid="stHeader"] { background: rgba(245,247,250,0.85); }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # -------------------------------------------------
 # Database layer: Google Sheets (preferred) + SQLite fallback
 # -------------------------------------------------
@@ -676,11 +764,10 @@ def inventory_subtotals(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: bool = True):
-    """Show certificate PDF preview + optional Drive backup (used after row click)."""
+    """Overlay content: stone details + certificate image."""
     cert = str(cert or "").strip()
     if not cert:
         return
-    st.markdown(f"### Certificate {cert}")
     existing = load_all_inventory()
     link = cert_link
     backup_link = ""
@@ -693,6 +780,28 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
                 link = str(match_row.get("CERTIFICATE LINK") or "")
             backup_link = str(match_row.get("Certificate PDF Backup Drive Link") or "").strip()
 
+    def _v(key, default="—"):
+        if not match_row:
+            return default
+        val = match_row.get(key)
+        return str(val) if val not in (None, "") else default
+
+    st.markdown(
+        f"""
+        <div class="detail-kv">
+          <div class="k">Lab</div><div class="v">{_v("Lab")}</div>
+          <div class="k">Shape</div><div class="v">{_v("SHAPE AND CUT")}</div>
+          <div class="k">Carat</div><div class="v">{_v("CARAT WEIGHT")}</div>
+          <div class="k">Color</div><div class="v">{_v("COLOR GRADE")}</div>
+          <div class="k">Clarity</div><div class="v">{_v("CLARITY GRADE")}</div>
+          <div class="k">Measurements</div><div class="v">{_v("MEASUREMENTS")}</div>
+          <div class="k">Process</div><div class="v">{_v("Process")}</div>
+          <div class="k">Location</div><div class="v">{_v("Current Location/Status")}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     c1, c2, c3 = st.columns(3)
     with c1:
         do_backup = st.button(
@@ -701,10 +810,11 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
             disabled=not _has_gdrive_folder(),
         )
     with c2:
-        st.button("Refresh", key=f"prev_rel_{cert}")
+        if link:
+            st.link_button("Open report", link, use_container_width=True)
     with c3:
         if backup_link:
-            st.markdown(f"[Open saved copy]({backup_link})")
+            st.link_button("Saved copy", backup_link, use_container_width=True)
 
     pdf_bytes = None
     if do_backup and _has_gdrive_folder():
@@ -1226,6 +1336,88 @@ def backup_certificate_pdf_to_drive(cert: str, cert_link: str = "") -> Dict[str,
         return {"success": False, "error": f"Backup error: {str(e)[:300]}"}
 
 
+def parse_shape_and_cutting_style(text_upper: str) -> Optional[str]:
+    """
+    Extract full shape name from lab PDF text.
+    Handles multi-line values such as:
+      CUT CORNERED
+      RECTANGULAR MODIFIED
+      BRILLIANT
+    and noise like table percentages (66%) on the same line.
+    """
+    if not text_upper:
+        return None
+
+    # Capture up to ~120 chars after the label (across newlines), stop before measurements/grading
+    m = re.search(
+        r"SHAPE\s+AND\s+CUTTING\s+STYLE\s*[:\.]?\s*(.{5,120}?)(?:"
+        r"MEASUREMENTS?|GRADING\s+RESULTS|CARAT\s+WEIGHT|COLOR\s+GRADE|CLARITY\s+GRADE|"
+        r"PROPORTIONS|ADDITIONAL\s+GRADING|$)",
+        text_upper,
+        flags=re.DOTALL,
+    )
+    raw = m.group(1) if m else ""
+
+    # Known full phrases (prefer longest match)
+    known = [
+        "CUT CORNERED RECTANGULAR MODIFIED BRILLIANT",
+        "CUT CORNERED SQUARE MODIFIED BRILLIANT",
+        "CUSHION MODIFIED BRILLIANT",
+        "SQUARE EMERALD CUT",
+        "ROUND BRILLIANT",
+        "PRINCESS CUT",
+        "CUSHION BRILLIANT",
+        "OVAL BRILLIANT",
+        "PEAR BRILLIANT",
+        "MARQUISE BRILLIANT",
+        "EMERALD CUT",
+        "RADIANT CUT",
+        "HEART BRILLIANT",
+        "ASSCHER CUT",
+        "TRIANGLE BRILLIANT",
+        "TRILLIANT",
+        "BAGUETTE",
+        "TAPERED BAGUETTE",
+    ]
+    blob = re.sub(r"[\n\r]+", " ", raw)
+    blob = re.sub(r"\s+", " ", blob).strip()
+    # Drop pure numeric noise (table %, depths)
+    blob = re.sub(r"\b\d+\.?\d*\s*%?", " ", blob)
+    blob = re.sub(r"\s+", " ", blob).strip()
+
+    for phrase in known:
+        if phrase in blob or phrase in text_upper:
+            return phrase.title()
+
+    # Build from allowed shape words only (ignore PROPORTIONS noise)
+    allowed = {
+        "CUT", "CORNERED", "RECTANGULAR", "SQUARE", "MODIFIED", "BRILLIANT",
+        "ROUND", "PRINCESS", "CUSHION", "OVAL", "PEAR", "MARQUISE", "EMERALD",
+        "RADIANT", "HEART", "ASSCHER", "TRIANGLE", "TRILLIANT", "BAGUETTE",
+        "TAPERED", "STEP", "MIXED",
+    }
+    tokens = []
+    for tok in re.findall(r"[A-Z]+", blob):
+        if tok in allowed:
+            tokens.append(tok)
+        elif tokens and tok in ("MM", "CARAT", "CARATS", "GRADING", "RESULTS"):
+            break
+        elif tokens and tok not in allowed:
+            # stop once shape phrase ends
+            if len(tokens) >= 2:
+                break
+    if len(tokens) >= 2:
+        shape = " ".join(tokens)
+        if 4 < len(shape) < 80:
+            return shape.title()
+
+    # Fallback single-line known shapes anywhere in document
+    for phrase in known:
+        if phrase in text_upper:
+            return phrase.title()
+    return None
+
+
 def fetch_igi_report(report_no: str) -> Dict[str, Any]:
     """
     Fetch live IGI Laboratory Grown Diamond report from official PDF.
@@ -1264,23 +1456,10 @@ def fetch_igi_report(report_no: str) -> Dict[str, Any]:
         text_upper = text.upper()
         text_upper = text_upper.replace("×", "X").replace("–", "-").replace("—", "-")
 
-        # Shape
-        shape_patterns = [
-            r"SHAPE AND CUTTING STYLE\s*([A-Z0-9\s\-]+?)(?:\n|MEASUREMENTS|GRADING)",
-            r"SHAPE AND CUTTING STYLE\s*([^\n]{5,60})",
-            r"(ROUND BRILLIANT|PRINCESS CUT|CUSHION MODIFIED BRILLIANT|CUSHION BRILLIANT|"
-            r"OVAL BRILLIANT|PEAR BRILLIANT|MARQUISE BRILLIANT|EMERALD CUT|"
-            r"SQUARE EMERALD CUT|RADIANT CUT|HEART BRILLIANT|ASSCHER CUT|"
-            r"CUT CORNERED RECTANGULAR|TRIANGLE BRILLIANT|TRILLIANT)",
-        ]
-        for pat in shape_patterns:
-            m = re.search(pat, text_upper)
-            if m:
-                shape = re.sub(r'\s+', ' ', m.group(1)).strip()
-                shape = re.split(r'\s{2,}|\d|MM|CARAT', shape)[0].strip()
-                if 4 < len(shape) < 50:
-                    result["SHAPE AND CUT"] = shape.title()
-                    break
+        # Shape (may span multiple lines, e.g. CUT CORNERED / RECTANGULAR MODIFIED / BRILLIANT)
+        shape = parse_shape_and_cutting_style(text_upper)
+        if shape:
+            result["SHAPE AND CUT"] = shape
 
         # Measurements
         meas_patterns = [
@@ -1441,14 +1620,10 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
             if m:
                 result["Certificate Number"] = m.group(1)
 
-        # ---------- Shape ----------
-        m = re.search(r"SHAPE AND CUTTING STYLE[\s.]+([A-Z][A-Z\s\-]+?)(?:\n|MEASUREMENTS|$)", text_upper)
-        if not m:
-            m = re.search(r"(ROUND BRILLIANT|PRINCESS CUT|CUSHION MODIFIED BRILLIANT|CUSHION BRILLIANT|"
-                          r"OVAL BRILLIANT|PEAR BRILLIANT|MARQUISE BRILLIANT|EMERALD CUT|"
-                          r"SQUARE EMERALD CUT|RADIANT CUT|HEART BRILLIANT|ASSCHER CUT)", text_upper)
-        if m:
-            result["SHAPE AND CUT"] = re.sub(r'\s+', ' ', m.group(1)).strip().title()
+        # ---------- Shape (multi-line safe) ----------
+        shape = parse_shape_and_cutting_style(text_upper)
+        if shape:
+            result["SHAPE AND CUT"] = shape
 
         # ---------- Measurements ----------
         m = re.search(r"MEASUREMENTS[\s.]+([\d\.\s\-X]+)\s*MM", text_upper)
@@ -1624,12 +1799,12 @@ def fetch_gia_info(report_no: str, try_playwright: bool = False) -> Dict[str, An
 # Streamlit UI
 # -------------------------------------------------
 
-st.title("Certified Stone Inventory")
-st.caption("Centralized inventory · Certificate lookup · Media reference")
+st.markdown("## Certified Stone Inventory")
+st.caption("FGI · Certificate lookup and inventory")
 
 # Sidebar
 with st.sidebar:
-    st.subheader("Summary")
+    st.markdown("**Overview**")
     _stats_df = load_all_inventory()
     st.metric("Total certificates", len(_stats_df))
     _today = date.today().isoformat()
@@ -1637,12 +1812,7 @@ with st.sidebar:
     if not _stats_df.empty and "date_added" in _stats_df.columns:
         _added_today = int(_stats_df["date_added"].astype(str).str.startswith(_today).sum())
     st.metric("Added today", _added_today)
-    st.divider()
-    use_playwright = False  # reserved for internal GIA automation
-    if use_gsheets():
-        st.caption("Connected data store")
-    else:
-        st.caption("Local data store")
+    use_playwright = False
 
 # ---------- Tabs ----------
 tab_add, tab_all, tab_edit, tab_video = st.tabs([
@@ -1887,47 +2057,61 @@ with tab_all:
     if search_q.strip() and not view.empty:
         view = smart_filter(view, search_q)
 
-    render_inventory_subtotals(view, title=f"{len(view)}/{len(df_all)} shown")
+    # Full-width table; certificate detail opens as overlay on row select
+    list_cols = [
+        c for c in [
+            "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT",
+            "COLOR GRADE", "CLARITY GRADE", "Lab", "Process",
+            "Current Location/Status", "Price For stone",
+        ] if c in view.columns
+    ]
+
+    st.caption(f"{len(view)} of {len(df_all)} records")
     if view.empty:
         st.info("No matching records.")
     else:
         try:
             event = st.dataframe(
-                view,
+                view[list_cols] if list_cols else view,
                 use_container_width=True,
                 hide_index=True,
-                height=520,
+                height=600,
                 on_select="rerun",
                 selection_mode="single-row",
                 key="inventory_table_select",
             )
             sel_rows = event.selection.rows if event and event.selection else []
-            if sel_rows:
-                ridx = sel_rows[0]
-                if ridx < len(view):
-                    crow = view.iloc[ridx]
-                    open_certificate_preview(
-                        str(crow.get("Certificate Number", "")),
-                        str(crow.get("CERTIFICATE LINK", "") or ""),
-                    )
+            if sel_rows and sel_rows[0] < len(view):
+                crow = view.iloc[sel_rows[0]]
+                open_certificate_preview(
+                    str(crow.get("Certificate Number", "")),
+                    str(crow.get("CERTIFICATE LINK", "") or ""),
+                )
         except TypeError:
-            # Older Streamlit without on_select
-            st.dataframe(view, use_container_width=True, hide_index=True, height=520)
+            st.dataframe(
+                view[list_cols] if list_cols else view,
+                use_container_width=True,
+                hide_index=True,
+                height=600,
+            )
             pick = st.selectbox(
-                "Or pick certificate to preview",
+                "Certificate",
                 view["Certificate Number"].astype(str).tolist(),
                 key="inv_preview_pick",
             )
-            if st.button("Preview selected", key="inv_preview_btn"):
+            if st.button("Open details", key="inv_preview_btn"):
                 link = ""
                 m = view[view["Certificate Number"].astype(str) == pick]
                 if not m.empty:
                     link = str(m.iloc[0].get("CERTIFICATE LINK") or "")
                 open_certificate_preview(pick, link)
 
-        # Inline fallback panel when dialog is unavailable
+        # Fallback if dialog API is unavailable
         if not HAS_DIALOG and st.session_state.get("inline_preview_cert"):
-            with st.expander(f"Preview: {st.session_state['inline_preview_cert']}", expanded=True):
+            with st.expander(
+                f"Certificate {st.session_state['inline_preview_cert']}",
+                expanded=True,
+            ):
                 render_certificate_preview(
                     st.session_state["inline_preview_cert"],
                     st.session_state.get("inline_preview_link", ""),
@@ -1935,7 +2119,10 @@ with tab_all:
 
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            export = view.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns], errors="ignore")
+            export = view.drop(
+                columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns],
+                errors="ignore",
+            )
             export.to_excel(writer, index=False, sheet_name="Inventory")
         st.download_button(
             "Export Excel",
@@ -2036,5 +2223,4 @@ with tab_video:
             st.success(f"{len(results)} media link(s) saved.")
             st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
-st.divider()
-st.caption("Certified Stone Inventory · FGI")
+st.markdown('<div class="app-footer">Certified Stone Inventory · FGI</div>', unsafe_allow_html=True)
