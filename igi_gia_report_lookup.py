@@ -678,7 +678,7 @@ def inventory_subtotals(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: bool = True):
-    """Overlay content: stone details + certificate image."""
+    """Overlay: certificate image first, then compact specs and actions."""
     cert = str(cert or "").strip()
     if not cert:
         return
@@ -700,22 +700,31 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
         val = match_row.get(key)
         return str(val) if val not in (None, "") else default
 
-    st.markdown(
-        f"""
-        <div class="detail-kv">
-          <div class="k">Lab</div><div class="v">{_v("Lab")}</div>
-          <div class="k">Shape</div><div class="v">{_v("SHAPE AND CUT")}</div>
-          <div class="k">Carat</div><div class="v">{_v("CARAT WEIGHT")}</div>
-          <div class="k">Color</div><div class="v">{_v("COLOR GRADE")}</div>
-          <div class="k">Clarity</div><div class="v">{_v("CLARITY GRADE")}</div>
-          <div class="k">Measurements</div><div class="v">{_v("MEASUREMENTS")}</div>
-          <div class="k">Process</div><div class="v">{_v("Process")}</div>
-          <div class="k">Location</div><div class="v">{_v("Current Location/Status")}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    # 1) Certificate image first (no long text above)
+    with st.spinner("Loading certificate…"):
+        dl = download_certificate_pdf(cert, link)
+    pdf_bytes = dl.get("pdf_bytes") if dl.get("success") else None
+    if pdf_bytes:
+        images = pdf_to_preview_images(pdf_bytes, max_pages=1, scale=1.6)
+        if images:
+            st.image(images[0], use_container_width=True)
+        st.download_button(
+            "Download PDF",
+            data=pdf_bytes,
+            file_name=f"{cert}_certificate.pdf",
+            mime="application/pdf",
+            key=f"prev_dl_{cert}",
+        )
+    else:
+        st.warning(dl.get("error", "Certificate file is not available.") if dl else "Certificate file is not available.")
+
+    # 2) One compact summary line (not a long description block)
+    st.caption(
+        f"{_v('Lab')} · {_v('SHAPE AND CUT')} · {_v('CARAT WEIGHT')} · "
+        f"{_v('COLOR GRADE')} / {_v('CLARITY GRADE')} · {_v('MEASUREMENTS')} · {_v('Process')}"
     )
 
+    # 3) Actions
     c1, c2, c3 = st.columns(3)
     with c1:
         do_backup = st.button(
@@ -730,7 +739,6 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
         if backup_link:
             st.link_button("Saved copy", backup_link, use_container_width=True)
 
-    pdf_bytes = None
     if do_backup and _has_gdrive_folder():
         with st.spinner("Saving certificate…"):
             res = backup_certificate_pdf_to_drive(cert, link)
@@ -742,29 +750,8 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
                 row["CERTIFICATE LINK"] = link
             upsert_rows([row])
             st.success("Certificate copy saved.")
-            pdf_bytes = res.get("pdf_bytes")
         else:
             st.error(res.get("error", "Unable to save certificate copy."))
-
-    if pdf_bytes is None:
-        with st.spinner("Loading certificate…"):
-            dl = download_certificate_pdf(cert, link)
-        if not dl.get("success"):
-            st.warning(dl.get("error", "Certificate file is not available."))
-            return
-        pdf_bytes = dl["pdf_bytes"]
-
-    images = pdf_to_preview_images(pdf_bytes, max_pages=2, scale=1.5)
-    if images:
-        for i, img in enumerate(images):
-            st.image(img, caption=f"Page {i + 1}", use_container_width=True)
-    st.download_button(
-        "Download PDF",
-        data=pdf_bytes,
-        file_name=f"{cert}_certificate.pdf",
-        mime="application/pdf",
-        key=f"prev_dl_{cert}",
-    )
 
 
 # Modal popup when Streamlit supports st.dialog
@@ -1980,7 +1967,7 @@ with tab_all:
         ] if c in view.columns
     ]
 
-    st.caption(f"{len(view)} of {len(df_all)} records")
+    render_inventory_subtotals(view, title=f"{len(view)}/{len(df_all)} shown")
     if view.empty:
         st.info("No matching records.")
     else:
