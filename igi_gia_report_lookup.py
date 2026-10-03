@@ -40,85 +40,95 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    html, body, [class*="css"]  { font-family: 'Inter', system-ui, sans-serif; }
-    .stApp { background-color: #F5F7FA; }
+    /* Force readable light theme — dark text on light background */
+    :root, .stApp, [data-testid="stAppViewContainer"] {
+        background-color: #F5F7FA !important;
+        color: #111827 !important;
+    }
+    html, body, .stApp, .stMarkdown, p, span, label, li,
+    [data-testid="stMarkdownContainer"],
+    [data-testid="stWidgetLabel"],
+    [data-testid="stCaption"],
+    .stCaption {
+        color: #111827 !important;
+    }
+    h1, h2, h3, h4, h5, h6 {
+        color: #0B1F3A !important;
+        font-weight: 700 !important;
+    }
     [data-testid="stSidebar"] {
-        background-color: #FFFFFF;
+        background-color: #FFFFFF !important;
         border-right: 1px solid #E5E7EB;
     }
-    [data-testid="stSidebar"] .stMarkdown { color: #0B1F3A; }
-    h1 { color: #0B1F3A !important; font-weight: 700 !important; letter-spacing: -0.02em; }
-    h2, h3 { color: #0B1F3A !important; }
+    [data-testid="stSidebar"] * {
+        color: #111827 !important;
+    }
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {
+        color: #0B1F3A !important;
+    }
     div[data-testid="stMetric"] {
-        background: #FFFFFF;
+        background: #FFFFFF !important;
         border: 1px solid #E5E7EB;
         border-radius: 10px;
         padding: 12px 14px;
     }
-    div[data-testid="stMetric"] label { color: #6B7280 !important; }
-    div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #0B1F3A !important; }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-        background: transparent;
-        border-bottom: 1px solid #E5E7EB;
+    div[data-testid="stMetric"] label,
+    div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+        color: #4B5563 !important;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        color: #0B1F3A !important;
     }
     .stTabs [data-baseweb="tab"] {
-        border-radius: 0;
-        color: #6B7280;
+        color: #4B5563 !important;
         font-weight: 500;
     }
     .stTabs [aria-selected="true"] {
         color: #0B1F3A !important;
         border-bottom: 2px solid #0D9488 !important;
     }
-    .stButton > button[kind="primary"] {
-        background-color: #0B1F3A;
-        border-color: #0B1F3A;
-        border-radius: 8px;
-        font-weight: 600;
-    }
-    .stButton > button[kind="primary"]:hover {
-        background-color: #0D9488;
-        border-color: #0D9488;
+    .stTextInput input, .stTextArea textarea, .stSelectbox div,
+    [data-baseweb="input"] input, [data-baseweb="textarea"] textarea,
+    [data-baseweb="select"] > div {
+        color: #111827 !important;
+        background-color: #FFFFFF !important;
     }
     .stButton > button {
         border-radius: 8px;
+        color: #111827 !important;
     }
-    div[data-testid="stDataFrame"] {
-        border: 1px solid #E5E7EB;
-        border-radius: 10px;
-        overflow: hidden;
-        background: #FFFFFF;
+    .stButton > button[kind="primary"] {
+        background-color: #0B1F3A !important;
+        border-color: #0B1F3A !important;
+        color: #FFFFFF !important;
+        font-weight: 600;
     }
-    .detail-panel {
-        background: #FFFFFF;
-        border: 1px solid #E5E7EB;
-        border-radius: 12px;
-        padding: 18px 20px;
-        min-height: 520px;
+    .stButton > button[kind="primary"]:hover {
+        background-color: #0D9488 !important;
+        border-color: #0D9488 !important;
+        color: #FFFFFF !important;
     }
-    .detail-panel h3 {
-        margin-top: 0;
-        font-size: 1.05rem;
-        color: #0B1F3A;
+    div[data-testid="stDataFrame"],
+    div[data-testid="stDataFrame"] * {
+        color: #111827 !important;
     }
-    .detail-kv {
-        display: grid;
-        grid-template-columns: 120px 1fr;
-        gap: 6px 12px;
-        font-size: 0.92rem;
-        margin: 12px 0 16px 0;
-    }
-    .detail-kv .k { color: #6B7280; }
-    .detail-kv .v { color: #0B1F3A; font-weight: 500; }
+    .detail-kv .k { color: #4B5563 !important; }
+    .detail-kv .v { color: #0B1F3A !important; font-weight: 500; }
     .app-footer {
         text-align: center;
-        color: #9CA3AF;
+        color: #6B7280 !important;
         font-size: 0.8rem;
         padding: 18px 0 8px 0;
     }
-    header[data-testid="stHeader"] { background: rgba(245,247,250,0.85); }
+    header[data-testid="stHeader"] {
+        background: #F5F7FA !important;
+    }
+    /* Info/success boxes stay readable */
+    .stAlert, [data-testid="stAlert"] {
+        color: #111827 !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
