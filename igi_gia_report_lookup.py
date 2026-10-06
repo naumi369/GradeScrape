@@ -1958,16 +1958,21 @@ with tab_all:
     if search_q.strip() and not view.empty:
         view = smart_filter(view, search_q)
 
-    # Full column set (including video + certificate links)
+    # Full column set — show actual URL text (not LinkColumn "Open")
     list_cols = [c for c in INVENTORY_COLUMNS if c in view.columns]
     display_df = view[list_cols].copy() if list_cols else view.copy()
 
-    # Make URL columns clickable when Streamlit supports LinkColumn
     col_config = {}
     for url_col in ("CERTIFICATE LINK", "Video URL", "Video Backup Drive Link", "Certificate PDF Backup Drive Link"):
         if url_col in display_df.columns:
+            def _clean_url(v):
+                s = str(v or "").strip()
+                if s.lower().startswith(("http://", "https://")):
+                    return s
+                return ""
+            display_df[url_col] = display_df[url_col].map(_clean_url)
             try:
-                col_config[url_col] = st.column_config.LinkColumn(url_col, display_text="Open")
+                col_config[url_col] = st.column_config.TextColumn(url_col, width="medium")
             except Exception:
                 pass
 
