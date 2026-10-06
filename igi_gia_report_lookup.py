@@ -1958,14 +1958,18 @@ with tab_all:
     if search_q.strip() and not view.empty:
         view = smart_filter(view, search_q)
 
-    # Full-width table; certificate detail opens as overlay on row select
-    list_cols = [
-        c for c in [
-            "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT",
-            "COLOR GRADE", "CLARITY GRADE", "Lab", "Process",
-            "Current Location/Status", "Price For stone",
-        ] if c in view.columns
-    ]
+    # Full column set (including video + certificate links)
+    list_cols = [c for c in INVENTORY_COLUMNS if c in view.columns]
+    display_df = view[list_cols].copy() if list_cols else view.copy()
+
+    # Make URL columns clickable when Streamlit supports LinkColumn
+    col_config = {}
+    for url_col in ("CERTIFICATE LINK", "Video URL", "Video Backup Drive Link", "Certificate PDF Backup Drive Link"):
+        if url_col in display_df.columns:
+            try:
+                col_config[url_col] = st.column_config.LinkColumn(url_col, display_text="Open")
+            except Exception:
+                pass
 
     render_inventory_subtotals(view, title=f"{len(view)}/{len(df_all)} shown")
     if view.empty:
@@ -1973,13 +1977,14 @@ with tab_all:
     else:
         try:
             event = st.dataframe(
-                view[list_cols] if list_cols else view,
+                display_df,
                 use_container_width=True,
                 hide_index=True,
                 height=600,
                 on_select="rerun",
                 selection_mode="single-row",
                 key="inventory_table_select",
+                column_config=col_config or None,
             )
             sel_rows = event.selection.rows if event and event.selection else []
             if sel_rows and sel_rows[0] < len(view):
@@ -1990,10 +1995,11 @@ with tab_all:
                 )
         except TypeError:
             st.dataframe(
-                view[list_cols] if list_cols else view,
+                display_df,
                 use_container_width=True,
                 hide_index=True,
                 height=600,
+                column_config=col_config or None,
             )
             pick = st.selectbox(
                 "Certificate",
