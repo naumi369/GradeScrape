@@ -1237,6 +1237,163 @@ def backup_certificate_pdf_to_drive(cert: str, cert_link: str = "") -> Dict[str,
         return {"success": False, "error": f"Backup error: {str(e)[:300]}"}
 
 
+def detect_lab_from_pdf_text(text_upper: str) -> str:
+    if "INTERNATIONAL GEMOLOGICAL INSTITUTE" in text_upper or re.search(r"\bIGI\b", text_upper):
+        if "LABORATORY GROWN" in text_upper or "LG" in text_upper:
+            return "IGI"
+        return "IGI"
+    if "GEMOLOGICAL INSTITUTE OF AMERICA" in text_upper or re.search(r"\bGIA\b", text_upper):
+        return "GIA"
+    return "Unknown"
+
+
+def extract_report_number_from_pdf_text(text_upper: str, lab: str = "") -> str:
+    m = re.search(r"\b(LG\d{8,12})\b", text_upper)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:IGI\s+)?REPORT\s+NUMBER\s*(LG?\d{8,12})", text_upper)
+    if m:
+        val = m.group(1)
+        if not val.startswith("LG") and lab == "IGI":
+            return f"LG{val}" if val.isdigit() else val
+        return val
+    m = re.search(r"GIA\s+REPORT\s+(?:NUMBER|#)?\s*(\d{8,13})", text_upper)
+    if m:
+        return m.group(1)
+    m = re.search(r"REPORT\s+NUMBER\s*(\d{8,13})", text_upper)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def apply_grading_fields_from_text(result: Dict[str, Any], text_upper: str) -> Dict[str, Any]:
+    """Fill shape, measurements, carat, color, clarity, cut quality, process from PDF text."""
+    text_upper = text_upper.replace("×", "X").replace("–", "-").replace("—", "-")
+
+    shape = parse_shape_and_cutting_style(text_upper)
+    if shape:
+        result["SHAPE AND CUT"] = shape
+
+    for pat in [
+        r"MEASUREMENTS?\s*([\d\.\-\sX]+?\s*MM)",
+        r"([\d\.]+\s*[-–]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+\s*MM)",
+        r"([\d\.]+\s*[Xx×]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+\s*MM)",
+    ]:
+        m = re.search(pat, text_upper)
+        if m:
+            size = m.group(1).strip().replace("X", "×").replace("x", "×")
+            size = re.sub(r"\s+", " ", size)
+            if "MM" not in size.upper():
+                size += " mm"
+            else:
+                size = size.replace("MM", "mm")
+            result["MEASUREMENTS"] = size
+            break
+
+    for pat in [
+        r"CARAT\s+WEIGHT\s*[:\.]?\s*(\d+\.\d{1,3})\s*CARATS?",
+        r"(\d+\.\d{2})\s*CARATS?",
+        r"(\d+\.\d{2})\s*CT\b",
+    ]:
+        m = re.search(pat, text_upper)
+        if m:
+            result["CARAT WEIGHT"] = f"{m.group(1)} ct"
+            break
+
+    for pat in [r"COLOR\s+GRADE\s*[:\.]?\s*([D-Z])\b", r"\bCOLOR\s*[:\.]?\s*([D-Z])\b"]:
+        m = re.search(pat, text_upper)
+        if m:
+            result["COLOR GRADE"] = m.group(1)
+            break
+
+    for pat in [
+        r"CLARITY\s+GRADE\s*[:\.]?\s*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
+        r"\bCLARITY\s*[:\.]?\s*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
+    ]:
+        m = re.search(pat, text_upper)
+        if m:
+            result["CLARITY GRADE"] = re.sub(r"\s+", "", m.group(1)).upper()
+            break
+
+    m = re.search(r"CUT\s+GRADE\s*(IDEAL|EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+    if m:
+        result["CUT"] = m.group(1).title()
+    m = re.search(r"\bPOLISH\s*(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+    if m:
+        result["POLISH"] = m.group(1).title()
+    m = re.search(r"\bSYMMETRY\s*(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
+    if m:
+        result["SYMMETRY"] = m.group(1).title()
+    m = re.search(r"\bFLUORESCENCE\s*(NONE|FAINT|MEDIUM|STRONG|VERY STRONG)", text_upper)
+    if m:
+        result["FLUORESCENCE"] = m.group(1).title()
+
+    if re.search(r"CHEMICAL\s+VAPOR\s+DEPOSITION|\bCVD\b", text_upper):
+        result["Process"] = "CVD"
+    elif re.search(r"HIGH\s+PRESSURE\s+HIGH\s+TEMPERATURE|\bHPHT\b", text_upper):
+        result["Process"] = "HPHT"
+
+    if "LABORATORY GROWN" in text_upper or "LAB GROWN" in text_upper:
+        result["DESCRIPTION"] = "LABORATORY GROWN DIAMOND"
+    elif "NATURAL" in text_upper and "DIAMOND" in text_upper:
+        result["DESCRIPTION"] = "NATURAL DIAMOND"
+
+    return result
+
+
+def parse_certificate_pdf_bytes(pdf_bytes: bytes, filename: str = "") -> Dict[str, Any]:
+    """Parse an uploaded IGI/GIA certificate PDF into an inventory row."""
+    if not pdf_bytes or pdf_bytes[:4] != b"%PDF":
+        row = empty_inventory_row("", "Unknown")
+        row["Status"] = "Error"
+        row["Notes"] = "Not a valid PDF file"
+        return row
+
+    text = extract_text_from_pdf(pdf_bytes)
+    if not text or len(text.strip()) < 40:
+        row = empty_inventory_row("", "Unknown")
+        row["Status"] = "Parse Error"
+        row["Notes"] = "Could not extract text from PDF"
+        return row
+
+    text_upper = text.upper()
+    lab = detect_lab_from_pdf_text(text_upper)
+    cert = extract_report_number_from_pdf_text(text_upper, lab)
+    if not cert and filename:
+        m = re.search(r"(LG\d{8,12}|\d{8,13})", filename.upper())
+        if m:
+            cert = m.group(1)
+
+    result = empty_inventory_row(cert or "Unknown", lab if lab != "Unknown" else infer_lab(cert or ""))
+    result["Lab"] = lab if lab != "Unknown" else result.get("Lab") or infer_lab(cert or "")
+    if cert:
+        result["Certificate Number"] = cert
+        if result["Lab"] == "IGI" and cert.upper().startswith("LG"):
+            number_only = re.sub(r"^LG", "", cert, flags=re.I)
+            result["CERTIFICATE LINK"] = f"https://pdf.igi.org/FDR{number_only}.pdf"
+        elif result["Lab"] == "GIA" and cert.isdigit():
+            result["CERTIFICATE LINK"] = f"https://www.gia.edu/report-check?reportno={cert}"
+
+    apply_grading_fields_from_text(result, text_upper)
+
+    filled = sum(
+        1
+        for k in ["SHAPE AND CUT", "MEASUREMENTS", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"]
+        if result.get(k)
+    )
+    if filled >= 3:
+        result["Status"] = "Success"
+        result["Notes"] = f"Uploaded PDF · {filled}/5 core fields"
+    elif filled >= 1:
+        result["Status"] = "Partial"
+        result["Notes"] = f"Uploaded PDF · partial {filled}/5 fields"
+    else:
+        result["Status"] = "Parse Error"
+        result["Notes"] = "Uploaded PDF · key fields not found"
+
+    return result
+
+
 def parse_shape_and_cutting_style(text_upper: str) -> Optional[str]:
     """
     Extract full shape name from lab PDF text.
@@ -1727,10 +1884,11 @@ tab_add, tab_all, tab_edit, tab_video = st.tabs([
 # TAB 1 – Add new certificates
 # =========================================================
 with tab_add:
+    st.markdown("##### Fetch by certificate number")
     report_text = st.text_area(
         "Certificate numbers",
         value="",
-        height=160,
+        height=140,
         placeholder="Enter one certificate number per line (IGI or GIA)",
     )
     col1, col2 = st.columns([1, 1])
@@ -1741,6 +1899,38 @@ with tab_add:
 
     if clear_btn:
         st.rerun()
+
+    st.divider()
+    st.markdown("##### Upload certificate PDF")
+    st.caption("Use when live fetch is blocked (e.g. some IGI/GIA reports). Upload the PDF from your browser download.")
+    uploaded_files = st.file_uploader(
+        "Certificate PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="cert_pdf_uploader",
+    )
+    upload_btn = st.button("Parse & save PDFs", type="primary", use_container_width=True, key="parse_pdfs_btn")
+
+    if upload_btn and uploaded_files:
+        results_upload = []
+        progress = st.progress(0)
+        for i, uf in enumerate(uploaded_files):
+            raw = uf.read()
+            row = parse_certificate_pdf_bytes(raw, filename=uf.name)
+            results_upload.append(row)
+            progress.progress((i + 1) / max(len(uploaded_files), 1))
+        if results_upload:
+            upsert_rows(results_upload)
+            st.success(f"{len(results_upload)} PDF(s) parsed and saved.")
+            show_cols = [
+                c for c in [
+                    "Certificate Number", "Lab", "SHAPE AND CUT", "CARAT WEIGHT",
+                    "COLOR GRADE", "CLARITY GRADE", "MEASUREMENTS", "Process", "Status", "Notes",
+                ] if c in results_upload[0]
+            ]
+            st.dataframe(pd.DataFrame(results_upload)[show_cols], use_container_width=True, hide_index=True)
+    elif upload_btn and not uploaded_files:
+        st.warning("Please choose one or more PDF files first.")
 
     if fetch_btn and report_text.strip():
         raw_lines = [line.strip() for line in report_text.strip().splitlines() if line.strip()]
