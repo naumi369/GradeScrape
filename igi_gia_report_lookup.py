@@ -284,7 +284,7 @@ def _ensure_sheet_headers(ws) -> None:
         or list(current[: len(SHEET_HEADERS)]) != list(SHEET_HEADERS)
     )
     if needs_fix:
-        ws.update("A1", [SHEET_HEADERS], value_input_option="USER_ENTERED")
+        _ws_update(ws, "A1", [list(SHEET_HEADERS)], value_input_option="USER_ENTERED")
 
 
 def _sheet_records() -> List[Dict[str, str]]:
@@ -335,6 +335,19 @@ def _sheets_api_call(fn, retries: int = 4):
             time.sleep(2 ** attempt + 0.5)
     if last_err:
         raise last_err
+
+
+def _ws_update(ws, range_name: str, values_2d: List[List[Any]], value_input_option: str = "USER_ENTERED"):
+    """
+    Compatible with gspread v5 and v6+.
+    v6 swapped positional args; always use keyword arguments.
+    values_2d must be a list of rows (2D).
+    """
+    return ws.update(
+        values=values_2d,
+        range_name=range_name,
+        value_input_option=value_input_option,
+    )
 
 
 def upsert_rows(rows: List[Dict[str, Any]]):
@@ -437,12 +450,10 @@ def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
                     values[pos] = str(old[date_added_idx])
                 except ValueError:
                     pass
-            # Update one row (with retry)
+            # Update one row (gspread v5/v6 safe kwargs)
             _sheets_api_call(
-                lambda r=ridx, v=values: ws.update(
-                    f"A{r}",
-                    [v],
-                    value_input_option="USER_ENTERED",
+                lambda r=ridx, v=list(values): _ws_update(
+                    ws, f"A{r}", [v], value_input_option="USER_ENTERED"
                 )
             )
             time.sleep(0.15)  # gentle on write quota
