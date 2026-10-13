@@ -317,24 +317,77 @@ def _sheet_records() -> List[Dict[str, str]]:
     return rows
 
 
+def _sheets_api_call(fn, retries: int = 4):
+    """Run a Sheets API call with retry on quota / transient errors."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            retryable = any(
+                x in msg
+                for x in ("429", "Quota", "RATE_LIMIT", "503", "500", "Backend Error", "Timeout", "timed out")
+            )
+            if not retryable or attempt >= retries - 1:
+                raise
+            time.sleep(2 ** attempt + 0.5)
+    if last_err:
+        raise last_err
+
+
 def upsert_rows(rows: List[Dict[str, Any]]):
     """Insert or update rows. Preserves existing editable fields on update."""
+    if not rows:
+        return
     if use_gsheets():
-        _upsert_rows_gsheets(rows)
-        clear_inventory_cache()
+        try:
+            _upsert_rows_gsheets(rows)
+            clear_inventory_cache()
+        except Exception as e:
+            msg = str(e)
+            # Fall back to SQLite so fetch is not lost
+            try:
+                _upsert_rows_sqlite(rows)
+            except Exception:
+                pass
+            if "429" in msg or "Quota" in msg:
+                raise RuntimeError(
+                    "Google Sheets quota exceeded. Wait about 1 minute and try a smaller batch. "
+                    "Data was also saved to local backup when possible."
+                ) from e
+            if "403" in msg or "PERMISSION" in msg.upper() or "permission" in msg.lower():
+                raise RuntimeError(
+                    "Google Sheets permission error. Share the spreadsheet with the service account "
+                    "email as Editor."
+                ) from e
+            if "404" in msg or "not found" in msg.lower():
+                raise RuntimeError(
+                    "Google Sheet not found. Check spreadsheet_id and worksheet_name in secrets."
+                ) from e
+            raise RuntimeError(f"Google Sheets save failed: {msg[:300]}") from e
     else:
         _upsert_rows_sqlite(rows)
 
 
 def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
+    """Batch-friendly upsert: update existing rows, append new ones in one call."""
     ws = _open_worksheet()
-    existing = ws.get_all_values()
+    _ensure_sheet_headers(ws)
+
+    existing = _sheets_api_call(lambda: ws.get_all_values())
     if not existing:
-        ws.append_row(SHEET_HEADERS)
+        _sheets_api_call(lambda: ws.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED"))
         existing = [SHEET_HEADERS]
 
     header = existing[0]
-    # Map certificate number -> row index (1-based in Sheets)
+    # Align to full SHEET_HEADERS if sheet is older / shorter
+    if list(header[: len(SHEET_HEADERS)]) != list(SHEET_HEADERS):
+        _ensure_sheet_headers(ws)
+        existing = _sheets_api_call(lambda: ws.get_all_values())
+        header = existing[0] if existing else SHEET_HEADERS
+
     cert_col = 0
     try:
         cert_col = header.index("Certificate Number")
@@ -343,10 +396,9 @@ def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
 
     index_by_cert = {}
     for i, row in enumerate(existing[1:], start=2):
-        if len(row) > cert_col and row[cert_col]:
-            index_by_cert[row[cert_col].strip()] = i
+        if len(row) > cert_col and str(row[cert_col]).strip():
+            index_by_cert[str(row[cert_col]).strip()] = i
 
-    # Column indices for editable fields (to preserve)
     def col_idx(name):
         try:
             return header.index(name)
@@ -356,37 +408,57 @@ def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
     editable_idx = {name: col_idx(name) for name in EDITABLE_COLUMNS}
     date_added_idx = col_idx("date_added")
 
+    to_append: List[List[str]] = []
     for row in rows:
         cert = (row.get("Certificate Number") or "").strip()
         if not cert:
             continue
         values = _row_to_sheet_list(row)
+        # Sheets rejects non-string / None in some cases
+        values = ["" if v is None else str(v) for v in values]
+        # Pad / trim to header width
+        if len(values) < len(SHEET_HEADERS):
+            values = values + [""] * (len(SHEET_HEADERS) - len(values))
+        values = values[: len(SHEET_HEADERS)]
 
         if cert in index_by_cert:
             ridx = index_by_cert[cert]
             old = existing[ridx - 1] if ridx - 1 < len(existing) else []
-            # Preserve non-empty editable fields
             for name, cidx in editable_idx.items():
-                if cidx is not None and cidx < len(old) and old[cidx]:
-                    # Find position in SHEET_HEADERS
+                if cidx is not None and cidx < len(old) and str(old[cidx]).strip():
                     try:
                         pos = SHEET_HEADERS.index(name)
-                        values[pos] = old[cidx]
+                        values[pos] = str(old[cidx])
                     except ValueError:
                         pass
-            # Preserve original date_added
-            if date_added_idx is not None and date_added_idx < len(old) and old[date_added_idx]:
+            if date_added_idx is not None and date_added_idx < len(old) and str(old[date_added_idx]).strip():
                 try:
                     pos = SHEET_HEADERS.index("date_added")
-                    values[pos] = old[date_added_idx]
+                    values[pos] = str(old[date_added_idx])
                 except ValueError:
                     pass
-            # Update row
-            end_col = chr(ord('A') + len(values) - 1) if len(values) <= 26 else "Z"
-            # Use update with range for full row
-            ws.update(f"A{ridx}", [values], value_input_option="USER_ENTERED")
+            # Update one row (with retry)
+            _sheets_api_call(
+                lambda r=ridx, v=values: ws.update(
+                    f"A{r}",
+                    [v],
+                    value_input_option="USER_ENTERED",
+                )
+            )
+            time.sleep(0.15)  # gentle on write quota
         else:
-            ws.append_row(values, value_input_option="USER_ENTERED")
+            to_append.append(values)
+            index_by_cert[cert] = -1  # mark so duplicates in same batch don't double-append
+
+    if to_append:
+        # Single batch append (far fewer API calls than append_row in a loop)
+        _sheets_api_call(
+            lambda: ws.append_rows(
+                to_append,
+                value_input_option="USER_ENTERED",
+                table_range="A1",
+            )
+        )
 
 
 def _upsert_rows_sqlite(rows: List[Dict[str, Any]]):
