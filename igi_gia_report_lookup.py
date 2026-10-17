@@ -11,8 +11,9 @@ import re
 import io
 import sqlite3
 import os
+import zipfile
 from datetime import datetime, date
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import time
 
 # Optional: pdfplumber for better PDF text extraction
@@ -317,32 +318,45 @@ def _sheet_records() -> List[Dict[str, str]]:
     return rows
 
 
-def _sheets_api_call(fn, retries: int = 4):
-    """Run a Sheets API call with retry on quota / transient errors."""
+def _gspread_error_detail(e: Exception) -> str:
+    """Pull status + body from gspread APIError when available."""
+    parts = [str(e)]
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            parts.append(f"HTTP {getattr(resp, 'status_code', '?')}")
+            text = getattr(resp, "text", None) or getattr(resp, "content", b"")
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="ignore")
+            if text:
+                parts.append(str(text)[:400])
+        except Exception:
+            pass
+    return " | ".join(parts)[:600]
+
+
+def _sheets_api_call(fn, retries: int = 3):
+    """Run a Sheets API call with limited retry on quota / transient errors."""
     last_err = None
     for attempt in range(retries):
         try:
             return fn()
         except Exception as e:
             last_err = e
-            msg = str(e)
+            msg = _gspread_error_detail(e)
             retryable = any(
                 x in msg
                 for x in ("429", "Quota", "RATE_LIMIT", "503", "500", "Backend Error", "Timeout", "timed out")
             )
             if not retryable or attempt >= retries - 1:
                 raise
-            time.sleep(2 ** attempt + 0.5)
+            time.sleep(3 + 2 ** attempt)
     if last_err:
         raise last_err
 
 
 def _ws_update(ws, range_name: str, values_2d: List[List[Any]], value_input_option: str = "USER_ENTERED"):
-    """
-    Compatible with gspread v5 and v6+.
-    v6 swapped positional args; always use keyword arguments.
-    values_2d must be a list of rows (2D).
-    """
+    """gspread v5/v6 compatible single-range update."""
     return ws.update(
         values=values_2d,
         range_name=range_name,
@@ -359,47 +373,74 @@ def upsert_rows(rows: List[Dict[str, Any]]):
             _upsert_rows_gsheets(rows)
             clear_inventory_cache()
         except Exception as e:
-            msg = str(e)
-            # Fall back to SQLite so fetch is not lost
+            detail = _gspread_error_detail(e)
+            # Always try local SQLite so fetch results are not lost on Streamlit
+            sqlite_ok = False
             try:
                 _upsert_rows_sqlite(rows)
+                sqlite_ok = True
             except Exception:
                 pass
-            if "429" in msg or "Quota" in msg:
+            hint = " Local backup saved." if sqlite_ok else ""
+            if "429" in detail or "Quota" in detail:
+                # Soft failure: show warning in UI path via session; don't crash the whole script if possible
+                st.session_state["sheets_save_warning"] = (
+                    "Google Sheets write quota exceeded. Wait 1–2 minutes, then save a smaller batch."
+                    + hint
+                )
+                if sqlite_ok:
+                    return  # do not crash the app
                 raise RuntimeError(
-                    "Google Sheets quota exceeded. Wait about 1 minute and try a smaller batch. "
-                    "Data was also saved to local backup when possible."
+                    "Google Sheets quota exceeded. Wait 1–2 minutes and try fewer certificates." + hint
                 ) from e
-            if "403" in msg or "PERMISSION" in msg.upper() or "permission" in msg.lower():
+            if "403" in detail or "PERMISSION" in detail.upper() or "permission" in detail.lower():
                 raise RuntimeError(
-                    "Google Sheets permission error. Share the spreadsheet with the service account "
-                    "email as Editor."
+                    "Google Sheets permission error. Share the spreadsheet with the service account as Editor."
+                    + hint
                 ) from e
-            if "404" in msg or "not found" in msg.lower():
+            if "404" in detail or "not found" in detail.lower():
                 raise RuntimeError(
-                    "Google Sheet not found. Check spreadsheet_id and worksheet_name in secrets."
+                    "Google Sheet not found. Check spreadsheet_id / worksheet_name in secrets." + hint
                 ) from e
-            raise RuntimeError(f"Google Sheets save failed: {msg[:300]}") from e
+            raise RuntimeError(f"Google Sheets save failed: {detail}" + hint) from e
     else:
         _upsert_rows_sqlite(rows)
 
 
 def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
-    """Batch-friendly upsert: update existing rows, append new ones in one call."""
+    """Upsert using batch_update (1 write) + optional append_rows (1 write)."""
     ws = _open_worksheet()
-    _ensure_sheet_headers(ws)
+    try:
+        _ensure_sheet_headers(ws)
+    except Exception:
+        pass
+
+    # Ensure grid is wide/tall enough
+    try:
+        need_cols = max(len(SHEET_HEADERS) + 2, 30)
+        need_rows = max(len(rows) + 500, 1000)
+        if getattr(ws, "col_count", 0) and ws.col_count < need_cols:
+            ws.resize(rows=max(ws.row_count, need_rows), cols=need_cols)
+        elif getattr(ws, "row_count", 0) and ws.row_count < need_rows:
+            ws.resize(rows=need_rows, cols=max(getattr(ws, "col_count", need_cols), need_cols))
+    except Exception:
+        pass
 
     existing = _sheets_api_call(lambda: ws.get_all_values())
     if not existing:
-        _sheets_api_call(lambda: ws.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED"))
-        existing = [SHEET_HEADERS]
+        _sheets_api_call(
+            lambda: ws.append_row(list(SHEET_HEADERS), value_input_option="USER_ENTERED")
+        )
+        existing = [list(SHEET_HEADERS)]
 
     header = existing[0]
-    # Align to full SHEET_HEADERS if sheet is older / shorter
     if list(header[: len(SHEET_HEADERS)]) != list(SHEET_HEADERS):
-        _ensure_sheet_headers(ws)
-        existing = _sheets_api_call(lambda: ws.get_all_values())
-        header = existing[0] if existing else SHEET_HEADERS
+        try:
+            _ensure_sheet_headers(ws)
+            existing = _sheets_api_call(lambda: ws.get_all_values())
+            header = existing[0] if existing else list(SHEET_HEADERS)
+        except Exception:
+            header = list(SHEET_HEADERS)
 
     cert_col = 0
     try:
@@ -422,19 +463,19 @@ def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
     date_added_idx = col_idx("date_added")
 
     to_append: List[List[str]] = []
+    batch_data: List[Dict[str, Any]] = []
+
     for row in rows:
         cert = (row.get("Certificate Number") or "").strip()
         if not cert:
             continue
         values = _row_to_sheet_list(row)
-        # Sheets rejects non-string / None in some cases
         values = ["" if v is None else str(v) for v in values]
-        # Pad / trim to header width
         if len(values) < len(SHEET_HEADERS):
             values = values + [""] * (len(SHEET_HEADERS) - len(values))
         values = values[: len(SHEET_HEADERS)]
 
-        if cert in index_by_cert:
+        if cert in index_by_cert and index_by_cert[cert] > 0:
             ridx = index_by_cert[cert]
             old = existing[ridx - 1] if ridx - 1 < len(existing) else []
             for name, cidx in editable_idx.items():
@@ -450,19 +491,18 @@ def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
                     values[pos] = str(old[date_added_idx])
                 except ValueError:
                     pass
-            # Update one row (gspread v5/v6 safe kwargs)
-            _sheets_api_call(
-                lambda r=ridx, v=list(values): _ws_update(
-                    ws, f"A{r}", [v], value_input_option="USER_ENTERED"
-                )
-            )
-            time.sleep(0.15)  # gentle on write quota
+            batch_data.append({"range": f"A{ridx}", "values": [values]})
         else:
             to_append.append(values)
-            index_by_cert[cert] = -1  # mark so duplicates in same batch don't double-append
+            index_by_cert[cert] = -1
+
+    # One API call for all updates
+    if batch_data:
+        _sheets_api_call(
+            lambda: ws.batch_update(batch_data, value_input_option="USER_ENTERED")
+        )
 
     if to_append:
-        # Single batch append (far fewer API calls than append_row in a loop)
         _sheets_api_call(
             lambda: ws.append_rows(
                 to_append,
@@ -1181,6 +1221,51 @@ def resolve_certificate_pdf_url(cert: str, cert_link: str = "") -> Optional[str]
     if link.startswith("http"):
         return link
     return None
+
+
+def build_certificates_zip(
+    df: pd.DataFrame,
+    max_files: int = 80,
+    delay_sec: float = 0.35,
+) -> Tuple[Optional[bytes], List[Dict[str, str]]]:
+    """
+    Download certificate PDFs for rows in df and pack into a ZIP.
+    Returns (zip_bytes or None, status log rows).
+    """
+    if df is None or df.empty:
+        return None, []
+
+    logs: List[Dict[str, str]] = []
+    buf = io.BytesIO()
+    ok_count = 0
+    rows = df.head(max_files)
+
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for _, row in rows.iterrows():
+            cert = str(row.get("Certificate Number") or "").strip()
+            link = str(row.get("CERTIFICATE LINK") or "").strip()
+            if not cert:
+                continue
+            dl = download_certificate_pdf(cert, link)
+            if dl.get("success") and dl.get("pdf_bytes"):
+                safe = re.sub(r"[^\w\-]+", "_", cert)
+                zf.writestr(f"{safe}_certificate.pdf", dl["pdf_bytes"])
+                ok_count += 1
+                logs.append({"Certificate": cert, "Status": "OK"})
+            else:
+                logs.append(
+                    {
+                        "Certificate": cert,
+                        "Status": "Failed",
+                        "Note": str(dl.get("error") or "download failed")[:120],
+                    }
+                )
+            time.sleep(delay_sec)
+
+    if ok_count == 0:
+        return None, logs
+    buf.seek(0)
+    return buf.getvalue(), logs
 
 
 def download_certificate_pdf(cert: str, cert_link: str = "") -> Dict[str, Any]:
@@ -1942,6 +2027,9 @@ def fetch_gia_info(report_no: str, try_playwright: bool = False) -> Dict[str, An
 
 st.markdown("## Certified Stone Inventory")
 st.caption("FGI · Certificate lookup and inventory")
+_warn = st.session_state.pop("sheets_save_warning", None)
+if _warn:
+    st.warning(_warn)
 
 # Sidebar
 with st.sidebar:
@@ -2309,12 +2397,55 @@ with tab_all:
                 errors="ignore",
             )
             export.to_excel(writer, index=False, sheet_name="Inventory")
-        st.download_button(
-            "Export Excel",
-            data=buffer.getvalue(),
-            file_name="Filtered_Inventory.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+
+        e1, e2 = st.columns(2)
+        with e1:
+            st.download_button(
+                "Export Excel",
+                data=buffer.getvalue(),
+                file_name="Filtered_Inventory.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with e2:
+            n_view = len(view)
+            max_zip = 80
+            st.caption(f"Certificate PDFs for current filter ({min(n_view, max_zip)} max per run)")
+            if st.button(
+                "Prepare certificate ZIP",
+                use_container_width=True,
+                key="prep_cert_zip",
+                disabled=n_view == 0,
+            ):
+                with st.spinner(f"Downloading up to {min(n_view, max_zip)} certificate PDF(s)…"):
+                    zip_bytes, zip_logs = build_certificates_zip(view, max_files=max_zip)
+                st.session_state["cert_zip_bytes"] = zip_bytes
+                st.session_state["cert_zip_logs"] = zip_logs
+                st.session_state["cert_zip_name"] = f"Certificates_{date.today().isoformat()}.zip"
+
+            if st.session_state.get("cert_zip_bytes"):
+                st.download_button(
+                    "Download ZIP",
+                    data=st.session_state["cert_zip_bytes"],
+                    file_name=st.session_state.get("cert_zip_name") or "Certificates.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="dl_cert_zip",
+                )
+                logs = st.session_state.get("cert_zip_logs") or []
+                if logs:
+                    ok_n = sum(1 for x in logs if x.get("Status") == "OK")
+                    st.caption(f"ZIP ready: {ok_n}/{len(logs)} PDF(s) included")
+                    with st.expander("Download log"):
+                        st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
+            elif st.session_state.get("cert_zip_logs"):
+                st.warning("No PDFs could be downloaded for this filter (lab block or missing files).")
+                with st.expander("Download log"):
+                    st.dataframe(
+                        pd.DataFrame(st.session_state["cert_zip_logs"]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
 # =========================================================
 # TAB 3 – Edit editable fields
