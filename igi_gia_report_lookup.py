@@ -3,18 +3,48 @@ Certified Stone Inventory Application
 -------------------------------------
 Internal tool for certificate lookup, inventory management,
 and media reference for certified stones.
+
+Revision notes (vs. previous version)
+  * Upserts now MERGE instead of overwrite: a failed/partial re-fetch can no
+    longer blank existing grades; new non-empty values (e.g. a new video URL)
+    now win over old ones; rows without a real certificate number are skipped;
+    duplicates inside a batch are collapsed.
+  * SQLite schema now stores the three media columns and auto-migrates.
+  * Sheets are written with RAW input (no formula injection / no number
+    coercion); Excel exports are sanitised; reads never numericise.
+  * Header handling is name-based; unknown/extra sheet columns are preserved.
+  * Outbound fetches go through `safe_get` (host allow-list for lab PDFs,
+    private-address blocking for video URLs, redirect re-validation, size caps).
+  * Drive files are private unless `[drive] public_link = true` in secrets.
+  * Optional password gate via `[auth] password` in secrets.
+  * Edit tab saves only changed cells and detects conflicting edits.
+  * Add tab keeps results in session_state (row-click no longer wipes them);
+    save status is honest (no false "saved" on quota fallback).
+  * Parsers consolidated into one code path; lab detection / shape matching fixed.
+  * Certificate ZIP and preview downloads are parallel / cached.
+  * Dead Playwright code and Streamlit-compat fallbacks removed
+    (requires a Streamlit version with st.dialog and dataframe selection).
 """
 import streamlit as st
 import pandas as pd
 import requests
 import re
 import io
+import hmac
+import ipaddress
+import logging
+import socket
 import sqlite3
 import os
 import zipfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, date
 from typing import Optional, Dict, Any, List, Tuple
-import time
+from urllib.parse import urlparse, urljoin
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Optional: pdfplumber for better PDF text extraction
 try:
@@ -23,12 +53,23 @@ try:
 except ImportError:
     HAS_PDFPLUMBER = False
 
-# Optional: Playwright for GIA scraping
-try:
-    from playwright.sync_api import sync_playwright
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
+def _safe_name(s: Any) -> str:
+    return re.sub(r"[^\w\-]+", "_", str(s))
+
+
+# Streamlit renamed use_container_width=True -> width="stretch" (around 1.50).
+def _stretch_kwargs() -> Dict[str, Any]:
+    try:
+        ver = tuple(int(x) for x in st.__version__.split(".")[:2])
+    except Exception:
+        ver = (0, 0)
+    return {"width": "stretch"} if ver >= (1, 50) else {"use_container_width": True}
+
+
+_STRETCH = _stretch_kwargs()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("stone_inventory")
 
 st.set_page_config(
     page_title="Certified Stone Inventory",
@@ -37,10 +78,34 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Use default Streamlit theme (no custom CSS)
+# -------------------------------------------------
+# Optional password gate  ([auth] password = "..." in secrets)
+# For real SSO use st.login(); this is a minimal guard for internal tools.
+# -------------------------------------------------
+def _require_login() -> None:
+    try:
+        expected = st.secrets.get("auth", {}).get("password")
+    except Exception:
+        expected = None
+    if not expected:
+        return
+    if st.session_state.get("_authed"):
+        return
+    st.markdown("## Certified Stone Inventory")
+    pw = st.text_input("Password", type="password", key="_login_pw")
+    if pw:
+        if hmac.compare_digest(str(pw), str(expected)):
+            st.session_state["_authed"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+
+_require_login()
 
 # -------------------------------------------------
-# Database layer: Google Sheets (preferred) + SQLite fallback
+# Constants
 # -------------------------------------------------
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory.db")
 
@@ -64,12 +129,190 @@ EDITABLE_COLUMNS = [
     "Certificate PDF Backup Drive Link",
 ]
 
-SHEET_HEADERS = INVENTORY_COLUMNS  # same order written to Google Sheet
+# Fields that, when present, mean a row holds real certificate data
+CORE_FIELDS = ["SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE", "MEASUREMENTS"]
+
+# Mapping of sheet/app column name -> SQLite column name
+DB_COLUMN_MAP = {
+    "Certificate Number": "certificate_number",
+    "DESCRIPTION": "description",
+    "SHAPE AND CUT": "shape_and_cut",
+    "CARAT WEIGHT": "carat_weight",
+    "COLOR GRADE": "color_grade",
+    "CLARITY GRADE": "clarity_grade",
+    "MEASUREMENTS": "measurements",
+    "CUT": "cut_grade",
+    "POLISH": "polish",
+    "SYMMETRY": "symmetry",
+    "FLUORESCENCE": "fluorescence",
+    "Process": "process",
+    "FGI Item Number": "fgi_item_number",
+    "Date Shipped from India": "date_shipped_from_india",
+    "For stock or Customer": "for_stock_or_customer",
+    "Production Order #, if for stock": "production_order",
+    "Current Location/Status": "current_location_status",
+    "Price Per Carat": "price_per_carat",
+    "Price For stone": "price_for_stone",
+    "CERTIFICATE LINK": "certificate_link",
+    "Comment": "comment",
+    "Video URL": "video_url",
+    "Video Backup Drive Link": "video_backup_drive_link",
+    "Certificate PDF Backup Drive Link": "certificate_pdf_backup_drive_link",
+    "Lab": "lab",
+    "Status": "status",
+    "Notes": "notes",
+    "date_added": "date_added",
+    "last_updated": "last_updated",
+}
+DB_COLUMNS = [DB_COLUMN_MAP[c] for c in INVENTORY_COLUMNS]
+
+# Hosts we are willing to fetch lab certificates from (suffix match)
+CERT_ALLOWED_HOST_SUFFIXES = ("igi.org", "gia.edu", "amazonaws.com")
+
+MAX_PDF_BYTES = 25 * 1024 * 1024
+MAX_VIDEO_BYTES = 300 * 1024 * 1024
+CARAT_TOLERANCE = 0.12          # fractional carat search window (e.g. "1.5ct")
+
+FAILURE_STATUSES = {"Not Found", "Parse Error", "Link Ready", "Error", "Unknown Format"}
 
 
+def _is_failure_status(status: str) -> bool:
+    s = (status or "").strip()
+    return s in FAILURE_STATUSES or s.startswith("HTTP ")
+
+
+def _valid_cert(cert: Any) -> bool:
+    c = str(cert or "").strip()
+    return bool(c) and c.lower() not in ("unknown", "none", "nan")
+
+
+def _blank(v: Any) -> bool:
+    return v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == ""
+
+
+# -------------------------------------------------
+# Safe outbound HTTP
+# -------------------------------------------------
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=2, backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"), raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": _USER_AGENT})
+    return s
+
+
+_HTTP = _build_session()
+
+
+def _host_allowed(host: str, suffixes: Optional[Tuple[str, ...]]) -> bool:
+    host = (host or "").lower().rstrip(".")
+    return any(host == s or host.endswith("." + s) for s in (suffixes or ()))
+
+
+def _is_public_host(host: str) -> bool:
+    """Reject loopback / private / link-local / reserved targets (SSRF guard).
+    Note: does not defend against DNS rebinding between check and connect."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+class UnsafeURL(Exception):
+    pass
+
+
+def safe_get(
+    url: str,
+    *,
+    allowed_host_suffixes: Optional[Tuple[str, ...]] = None,
+    stream: bool = False,
+    timeout: int = 30,
+    headers: Optional[Dict[str, str]] = None,
+    max_redirects: int = 5,
+) -> requests.Response:
+    """GET with scheme check, optional host allow-list, public-address check and
+    per-hop redirect validation. Raises UnsafeURL if any hop is not permitted."""
+    current = str(url).strip()
+    for _ in range(max_redirects + 1):
+        p = urlparse(current)
+        if p.scheme != "https" and not (p.scheme == "http" and allowed_host_suffixes is None):
+            raise UnsafeURL(f"Blocked URL scheme: {p.scheme or 'none'}")
+        if not p.hostname:
+            raise UnsafeURL("Invalid URL")
+        if allowed_host_suffixes is not None and not _host_allowed(p.hostname, allowed_host_suffixes):
+            raise UnsafeURL(f"Host not allowed: {p.hostname}")
+        if not _is_public_host(p.hostname):
+            raise UnsafeURL(f"Blocked non-public address: {p.hostname}")
+        resp = _HTTP.get(current, timeout=timeout, headers=headers, stream=stream, allow_redirects=False)
+        if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+            nxt = resp.headers.get("Location")
+            resp.close()
+            if not nxt:
+                raise UnsafeURL("Redirect without Location")
+            current = urljoin(current, nxt)
+            continue
+        return resp
+    raise UnsafeURL("Too many redirects")
+
+
+def read_capped(resp: requests.Response, max_bytes: int) -> bytes:
+    """Read a streamed response body, aborting if it exceeds max_bytes."""
+    buf = bytearray()
+    for chunk in resp.iter_content(chunk_size=1024 * 256):
+        if not chunk:
+            continue
+        buf.extend(chunk)
+        if len(buf) > max_bytes:
+            resp.close()
+            raise ValueError(f"File exceeds {max_bytes // (1024 * 1024)} MB limit")
+    return bytes(buf)
+
+
+# -------------------------------------------------
+# Excel export helpers (formula-injection safe)
+# -------------------------------------------------
+def _xl_safe(v: Any) -> Any:
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + v
+    return v
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Inventory") -> bytes:
+    safe = df.copy()
+    for c in safe.columns:
+        if not pd.api.types.is_numeric_dtype(safe[c]) and not pd.api.types.is_bool_dtype(safe[c]):
+            safe[c] = safe[c].map(_xl_safe)      # works for object and pandas>=3 string dtypes
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        safe.to_excel(writer, index=False, sheet_name=sheet_name)
+    return buf.getvalue()
+
+# -------------------------------------------------
+# Database layer: Google Sheets (preferred) + SQLite fallback
+# -------------------------------------------------
 def _has_gsheets_secrets() -> bool:
     try:
-        return (
+        return bool(
             "gcp_service_account" in st.secrets
             and "sheets" in st.secrets
             and st.secrets["sheets"].get("spreadsheet_id")
@@ -85,12 +328,23 @@ def _has_gdrive_folder() -> bool:
         return False
 
 
+def _drive_public_link_enabled() -> bool:
+    """Drive files are private unless [drive] public_link = true."""
+    try:
+        return bool(st.secrets.get("drive", {}).get("public_link", False))
+    except Exception:
+        return False
+
+
 @st.cache_resource(show_spinner=False)
 def _get_google_creds():
     from google.oauth2.service_account import Credentials
+    # NOTE: "drive.file" is narrower than "drive" and is enough for files this
+    # app creates in a folder shared with the service account. Switch back to
+    # the full "drive" scope only if your folder setup requires it.
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.file",
     ]
     return Credentials.from_service_account_info(
         dict(st.secrets["gcp_service_account"]), scopes=scopes
@@ -119,8 +373,8 @@ def _open_worksheet():
     try:
         ws = sh.worksheet(ws_name)
     except Exception:
-        ws = sh.add_worksheet(title=ws_name, rows=2000, cols=len(SHEET_HEADERS))
-        ws.append_row(SHEET_HEADERS)
+        ws = sh.add_worksheet(title=ws_name, rows=2000, cols=len(INVENTORY_COLUMNS))
+        ws.append_row(INVENTORY_COLUMNS, value_input_option="RAW")
     return ws
 
 
@@ -128,196 +382,120 @@ def use_gsheets() -> bool:
     return _has_gsheets_secrets()
 
 
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+# ---------------- SQLite ----------------
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
-    """Initialize SQLite fallback table. Does not hit Google Sheets on every run."""
-    conn = get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS inventory (
-            certificate_number TEXT PRIMARY KEY,
-            description TEXT,
-            shape_and_cut TEXT,
-            carat_weight TEXT,
-            color_grade TEXT,
-            clarity_grade TEXT,
-            measurements TEXT,
-            cut_grade TEXT,
-            polish TEXT,
-            symmetry TEXT,
-            fluorescence TEXT,
-            process TEXT,
-            fgi_item_number TEXT,
-            date_shipped_from_india TEXT,
-            for_stock_or_customer TEXT,
-            production_order TEXT,
-            current_location_status TEXT,
-            price_per_carat TEXT,
-            price_for_stone TEXT,
-            certificate_link TEXT,
-            comment TEXT,
-            lab TEXT,
-            status TEXT,
-            notes TEXT,
-            date_added TEXT,
-            last_updated TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def row_to_db_dict(row: Dict[str, Any]) -> Dict[str, Any]:
-    now = datetime.now().isoformat(timespec="seconds")
-    return {
-        "certificate_number": row.get("Certificate Number") or "",
-        "description": row.get("DESCRIPTION") or "",
-        "shape_and_cut": row.get("SHAPE AND CUT") or "",
-        "carat_weight": row.get("CARAT WEIGHT") or "",
-        "color_grade": row.get("COLOR GRADE") or "",
-        "clarity_grade": row.get("CLARITY GRADE") or "",
-        "measurements": row.get("MEASUREMENTS") or "",
-        "cut_grade": row.get("CUT") or "",
-        "polish": row.get("POLISH") or "",
-        "symmetry": row.get("SYMMETRY") or "",
-        "fluorescence": row.get("FLUORESCENCE") or "",
-        "process": row.get("Process") or "",
-        "fgi_item_number": row.get("FGI Item Number") or "",
-        "date_shipped_from_india": row.get("Date Shipped from India") or "",
-        "for_stock_or_customer": row.get("For stock or Customer") or "",
-        "production_order": row.get("Production Order #, if for stock") or "",
-        "current_location_status": row.get("Current Location/Status") or "",
-        "price_per_carat": row.get("Price Per Carat") or "",
-        "price_for_stone": row.get("Price For stone") or "",
-        "certificate_link": row.get("CERTIFICATE LINK") or "",
-        "comment": row.get("Comment") or "",
-        "video_url": row.get("Video URL") or "",
-        "video_backup_drive_link": row.get("Video Backup Drive Link") or "",
-        "certificate_pdf_backup_drive_link": row.get("Certificate PDF Backup Drive Link") or "",
-        "lab": row.get("Lab") or "",
-        "status": row.get("Status") or "",
-        "notes": row.get("Notes") or "",
-        "date_added": row.get("date_added") or now,
-        "last_updated": now,
-    }
-
-
-def db_dict_to_row(d: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "Certificate Number": d.get("certificate_number"),
-        "DESCRIPTION": d.get("description"),
-        "SHAPE AND CUT": d.get("shape_and_cut"),
-        "CARAT WEIGHT": d.get("carat_weight"),
-        "COLOR GRADE": d.get("color_grade"),
-        "CLARITY GRADE": d.get("clarity_grade"),
-        "MEASUREMENTS": d.get("measurements"),
-        "CUT": d.get("cut_grade"),
-        "POLISH": d.get("polish"),
-        "SYMMETRY": d.get("symmetry"),
-        "FLUORESCENCE": d.get("fluorescence"),
-        "Process": d.get("process"),
-        "FGI Item Number": d.get("fgi_item_number"),
-        "Date Shipped from India": d.get("date_shipped_from_india"),
-        "For stock or Customer": d.get("for_stock_or_customer"),
-        "Production Order #, if for stock": d.get("production_order"),
-        "Current Location/Status": d.get("current_location_status"),
-        "Price Per Carat": d.get("price_per_carat"),
-        "Price For stone": d.get("price_for_stone"),
-        "CERTIFICATE LINK": d.get("certificate_link"),
-        "Comment": d.get("comment"),
-        "Video URL": d.get("video_url"),
-        "Video Backup Drive Link": d.get("video_backup_drive_link"),
-        "Certificate PDF Backup Drive Link": d.get("certificate_pdf_backup_drive_link"),
-        "Lab": d.get("lab"),
-        "Status": d.get("status"),
-        "Notes": d.get("notes"),
-        "date_added": d.get("date_added"),
-        "last_updated": d.get("last_updated"),
-    }
-
-
-def _row_to_sheet_list(row: Dict[str, Any]) -> List[str]:
-    """Ordered values matching SHEET_HEADERS."""
-    d = row_to_db_dict(row)
-    mapping = {
-        "Certificate Number": d["certificate_number"],
-        "DESCRIPTION": d["description"],
-        "SHAPE AND CUT": d["shape_and_cut"],
-        "CARAT WEIGHT": d["carat_weight"],
-        "COLOR GRADE": d["color_grade"],
-        "CLARITY GRADE": d["clarity_grade"],
-        "MEASUREMENTS": d["measurements"],
-        "CUT": d["cut_grade"],
-        "POLISH": d["polish"],
-        "SYMMETRY": d["symmetry"],
-        "FLUORESCENCE": d["fluorescence"],
-        "Process": d["process"],
-        "FGI Item Number": d["fgi_item_number"],
-        "Date Shipped from India": d["date_shipped_from_india"],
-        "For stock or Customer": d["for_stock_or_customer"],
-        "Production Order #, if for stock": d["production_order"],
-        "Current Location/Status": d["current_location_status"],
-        "Price Per Carat": d["price_per_carat"],
-        "Price For stone": d["price_for_stone"],
-        "CERTIFICATE LINK": d["certificate_link"],
-        "Comment": d["comment"],
-        "Video URL": d["video_url"],
-        "Video Backup Drive Link": d["video_backup_drive_link"],
-        "Certificate PDF Backup Drive Link": d["certificate_pdf_backup_drive_link"],
-        "Lab": d["lab"],
-        "Status": d["status"],
-        "Notes": d["notes"],
-        "date_added": d["date_added"],
-        "last_updated": d["last_updated"],
-    }
-    return [str(mapping.get(h, "") or "") for h in SHEET_HEADERS]
-
-
-def _ensure_sheet_headers(ws) -> None:
-    """Rewrite row 1 if it has blanks/duplicates or is missing new columns."""
-    current = ws.row_values(1)
-    needs_fix = (
-        not current
-        or any((h or "").strip() == "" for h in current)
-        or len(set(current)) != len(current)
-        or list(current[: len(SHEET_HEADERS)]) != list(SHEET_HEADERS)
+    """Create the SQLite table and migrate older databases (adds missing columns)."""
+    cols_sql = ",\n            ".join(
+        f"{c} TEXT" + (" PRIMARY KEY" if c == "certificate_number" else "")
+        for c in DB_COLUMNS
     )
-    if needs_fix:
-        _ws_update(ws, "A1", [list(SHEET_HEADERS)], value_input_option="USER_ENTERED")
+    with db() as conn:
+        conn.execute(f"CREATE TABLE IF NOT EXISTS inventory (\n            {cols_sql}\n        )")
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(inventory)")}
+        for c in DB_COLUMNS:
+            if c not in have:
+                conn.execute(f"ALTER TABLE inventory ADD COLUMN {c} TEXT")
+                logger.info("Migrated SQLite: added column %s", c)
 
 
-def _sheet_records() -> List[Dict[str, str]]:
-    ws = _open_worksheet()
-    try:
-        _ensure_sheet_headers(ws)
-    except Exception:
-        pass
+# ---------------- Row merge logic ----------------
+def _s(v: Any) -> str:
+    return "" if _blank(v) else str(v).strip()
 
-    # Prefer expected_headers (gspread ≥5) so duplicate blanks don't crash
-    try:
-        records = ws.get_all_records(expected_headers=SHEET_HEADERS)
-        return records or []
-    except TypeError:
-        pass
-    except Exception:
-        pass
 
-    # Manual parse fallback
-    values = ws.get_all_values()
-    if len(values) < 2:
-        return []
-    header = SHEET_HEADERS
-    rows = []
-    for raw in values[1:]:
-        if not any(str(c).strip() for c in raw):
+def _normalize_row(row: Dict[str, Any]) -> Dict[str, str]:
+    return {c: _s(row.get(c)) for c in INVENTORY_COLUMNS}
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def merge_row(new: Dict[str, Any], old: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """
+    Combine a freshly fetched/edited row with the stored one.
+
+    * New row, nothing stored        -> insert as is.
+    * Stored row exists              -> non-empty new values win; empty new
+                                        values never blank stored ones.
+    * New row is a failure status
+      (Not Found / Link Ready / ...) and stored row already has certificate
+      data                           -> only user-editable fields may change.
+    Returns None when nothing would change.
+    """
+    now = _now()
+    new = _normalize_row(new)
+    if old is None:
+        out = dict(new)
+        out["date_added"] = out["date_added"] or now
+        out["last_updated"] = now
+        return out
+
+    old = _normalize_row(old)
+    old_has_data = any(old[c] for c in CORE_FIELDS)
+
+    if _is_failure_status(new["Status"]) and old_has_data:
+        out = dict(old)
+        changed = False
+        for col in EDITABLE_COLUMNS:
+            if new[col] and new[col] != old[col]:
+                out[col] = new[col]
+                changed = True
+        if not changed:
+            return None
+        out["last_updated"] = now
+        return out
+
+    out = dict(old)
+    changed = False
+    for col in INVENTORY_COLUMNS:
+        if col in ("date_added", "last_updated"):
             continue
-        padded = list(raw) + [""] * max(0, len(header) - len(raw))
-        rows.append({header[i]: padded[i] for i in range(len(header))})
-    return rows
+        if new[col] and new[col] != old[col]:
+            out[col] = new[col]
+            changed = True
+    if not changed:
+        return None
+    out["date_added"] = old["date_added"] or new["date_added"] or now
+    out["last_updated"] = now
+    return out
 
 
+def _collapse_batch(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, str]], int]:
+    """Drop rows with no real certificate number and merge duplicates inside the batch."""
+    by_cert: Dict[str, Dict[str, str]] = {}
+    skipped = 0
+    for r in rows or []:
+        n = _normalize_row(r)
+        cert = n["Certificate Number"]
+        if not _valid_cert(cert):
+            skipped += 1
+            continue
+        if cert in by_cert:
+            for col, val in n.items():
+                if val and col not in ("date_added", "last_updated"):
+                    by_cert[cert][col] = val
+        else:
+            by_cert[cert] = n
+    return list(by_cert.values()), skipped
+
+
+# ---------------- Google Sheets helpers ----------------
 def _gspread_error_detail(e: Exception) -> str:
     """Pull status + body from gspread APIError when available."""
     parts = [str(e)]
@@ -331,18 +509,16 @@ def _gspread_error_detail(e: Exception) -> str:
             if text:
                 parts.append(str(text)[:400])
         except Exception:
-            pass
+            logger.debug("Could not parse gspread error body", exc_info=True)
     return " | ".join(parts)[:600]
 
 
 def _sheets_api_call(fn, retries: int = 3):
     """Run a Sheets API call with limited retry on quota / transient errors."""
-    last_err = None
     for attempt in range(retries):
         try:
             return fn()
         except Exception as e:
-            last_err = e
             msg = _gspread_error_detail(e)
             retryable = any(
                 x in msg
@@ -351,270 +527,242 @@ def _sheets_api_call(fn, retries: int = 3):
             if not retryable or attempt >= retries - 1:
                 raise
             time.sleep(3 + 2 ** attempt)
-    if last_err:
-        raise last_err
 
 
-def _ws_update(ws, range_name: str, values_2d: List[List[Any]], value_input_option: str = "USER_ENTERED"):
+def _ws_update(ws, range_name: str, values_2d: List[List[Any]], value_input_option: str = "RAW"):
     """gspread v5/v6 compatible single-range update."""
-    return ws.update(
-        values=values_2d,
-        range_name=range_name,
-        value_input_option=value_input_option,
-    )
+    return _sheets_api_call(lambda: ws.update(
+        values=values_2d, range_name=range_name, value_input_option=value_input_option,
+    ))
 
 
-def upsert_rows(rows: List[Dict[str, Any]]):
-    """Insert or update rows. Preserves existing editable fields on update."""
-    if not rows:
-        return
-    if use_gsheets():
-        try:
-            _upsert_rows_gsheets(rows)
-            clear_inventory_cache()
-        except Exception as e:
-            detail = _gspread_error_detail(e)
-            # Always try local SQLite so fetch results are not lost on Streamlit
-            sqlite_ok = False
-            try:
-                _upsert_rows_sqlite(rows)
-                sqlite_ok = True
-            except Exception:
-                pass
-            hint = " Local backup saved." if sqlite_ok else ""
-            if "429" in detail or "Quota" in detail:
-                # Soft failure: show warning in UI path via session; don't crash the whole script if possible
-                st.session_state["sheets_save_warning"] = (
-                    "Google Sheets write quota exceeded. Wait 1–2 minutes, then save a smaller batch."
-                    + hint
-                )
-                if sqlite_ok:
-                    return  # do not crash the app
-                raise RuntimeError(
-                    "Google Sheets quota exceeded. Wait 1–2 minutes and try fewer certificates." + hint
-                ) from e
-            if "403" in detail or "PERMISSION" in detail.upper() or "permission" in detail.lower():
-                raise RuntimeError(
-                    "Google Sheets permission error. Share the spreadsheet with the service account as Editor."
-                    + hint
-                ) from e
-            if "404" in detail or "not found" in detail.lower():
-                raise RuntimeError(
-                    "Google Sheet not found. Check spreadsheet_id / worksheet_name in secrets." + hint
-                ) from e
-            raise RuntimeError(f"Google Sheets save failed: {detail}" + hint) from e
-    else:
-        _upsert_rows_sqlite(rows)
+def _ensure_sheet_headers(ws) -> List[str]:
+    """
+    Make sure every app column exists in row 1 WITHOUT reordering or overwriting
+    what is already there (missing columns are appended on the right).
+    Returns the header row as it now stands.
+    """
+    current = _sheets_api_call(lambda: ws.row_values(1))
+    if not any((h or "").strip() for h in current):
+        _ws_update(ws, "A1", [list(INVENTORY_COLUMNS)])
+        return list(INVENTORY_COLUMNS)
+    have = {(h or "").strip() for h in current}
+    missing = [h for h in INVENTORY_COLUMNS if h not in have]
+    if not missing:
+        return list(current)
+    new_header = list(current) + missing
+    try:
+        if getattr(ws, "col_count", 0) < len(new_header):
+            _sheets_api_call(lambda: ws.resize(cols=len(new_header)))
+    except Exception:
+        logger.warning("Could not widen worksheet grid", exc_info=True)
+    _ws_update(ws, "A1", [new_header])
+    return new_header
 
 
-def _upsert_rows_gsheets(rows: List[Dict[str, Any]]):
-    """Upsert using batch_update (1 write) + optional append_rows (1 write)."""
+def _header_index(header: List[str]) -> Dict[str, int]:
+    idx: Dict[str, int] = {}
+    for i, h in enumerate(header):
+        idx.setdefault((h or "").strip(), i)   # first occurrence wins
+    return idx
+
+
+def _cell(row: List[str], idx: Dict[str, int], name: str) -> str:
+    i = idx.get(name)
+    return str(row[i]).strip() if i is not None and i < len(row) else ""
+
+
+def _sheet_frame() -> pd.DataFrame:
+    """Read the worksheet as strings, mapped by header NAME (never numericised)."""
     ws = _open_worksheet()
     try:
-        _ensure_sheet_headers(ws)
+        header = _ensure_sheet_headers(ws)
     except Exception:
-        pass
+        logger.warning("Header check failed", exc_info=True)
+        header = _sheets_api_call(lambda: ws.row_values(1))
+    values = _sheets_api_call(lambda: ws.get_all_values())
+    idx = _header_index(header)
+    rows = []
+    for raw in values[1:]:
+        if not any(str(c).strip() for c in raw):
+            continue
+        rows.append({c: _cell(raw, idx, c) for c in INVENTORY_COLUMNS})
+    df = pd.DataFrame(rows, columns=INVENTORY_COLUMNS)
+    if not df.empty:
+        df = df[df["Certificate Number"].astype(str).str.strip() != ""]
+        df = df.drop_duplicates(subset="Certificate Number", keep="first")
+    return df.reset_index(drop=True)
 
-    # Ensure grid is wide/tall enough
-    try:
-        need_cols = max(len(SHEET_HEADERS) + 2, 30)
-        need_rows = max(len(rows) + 500, 1000)
-        if getattr(ws, "col_count", 0) and ws.col_count < need_cols:
-            ws.resize(rows=max(ws.row_count, need_rows), cols=need_cols)
-        elif getattr(ws, "row_count", 0) and ws.row_count < need_rows:
-            ws.resize(rows=need_rows, cols=max(getattr(ws, "col_count", need_cols), need_cols))
-    except Exception:
-        pass
 
+def _upsert_rows_gsheets(rows: List[Dict[str, str]]) -> Dict[str, int]:
+    """Merge-upsert using one batch_update + one append_rows."""
+    ws = _open_worksheet()
+    header = _ensure_sheet_headers(ws)
     existing = _sheets_api_call(lambda: ws.get_all_values())
-    if not existing:
-        _sheets_api_call(
-            lambda: ws.append_row(list(SHEET_HEADERS), value_input_option="USER_ENTERED")
-        )
-        existing = [list(SHEET_HEADERS)]
+    idx = _header_index(header)
 
-    header = existing[0]
-    if list(header[: len(SHEET_HEADERS)]) != list(SHEET_HEADERS):
-        try:
-            _ensure_sheet_headers(ws)
-            existing = _sheets_api_call(lambda: ws.get_all_values())
-            header = existing[0] if existing else list(SHEET_HEADERS)
-        except Exception:
-            header = list(SHEET_HEADERS)
+    index_by_cert: Dict[str, int] = {}
+    for i, raw in enumerate(existing[1:], start=2):
+        c = _cell(raw, idx, "Certificate Number")
+        if c:
+            index_by_cert.setdefault(c, i)
 
-    cert_col = 0
-    try:
-        cert_col = header.index("Certificate Number")
-    except ValueError:
-        cert_col = 0
+    batch_data, to_append = [], []
+    counts = {"inserted": 0, "updated": 0, "unchanged": 0}
 
-    index_by_cert = {}
-    for i, row in enumerate(existing[1:], start=2):
-        if len(row) > cert_col and str(row[cert_col]).strip():
-            index_by_cert[str(row[cert_col]).strip()] = i
-
-    def col_idx(name):
-        try:
-            return header.index(name)
-        except ValueError:
-            return None
-
-    editable_idx = {name: col_idx(name) for name in EDITABLE_COLUMNS}
-    date_added_idx = col_idx("date_added")
-
-    to_append: List[List[str]] = []
-    batch_data: List[Dict[str, Any]] = []
-
-    for row in rows:
-        cert = (row.get("Certificate Number") or "").strip()
-        if not cert:
-            continue
-        values = _row_to_sheet_list(row)
-        values = ["" if v is None else str(v) for v in values]
-        if len(values) < len(SHEET_HEADERS):
-            values = values + [""] * (len(SHEET_HEADERS) - len(values))
-        values = values[: len(SHEET_HEADERS)]
-
-        if cert in index_by_cert and index_by_cert[cert] > 0:
-            ridx = index_by_cert[cert]
-            old = existing[ridx - 1] if ridx - 1 < len(existing) else []
-            for name, cidx in editable_idx.items():
-                if cidx is not None and cidx < len(old) and str(old[cidx]).strip():
-                    try:
-                        pos = SHEET_HEADERS.index(name)
-                        values[pos] = str(old[cidx])
-                    except ValueError:
-                        pass
-            if date_added_idx is not None and date_added_idx < len(old) and str(old[date_added_idx]).strip():
-                try:
-                    pos = SHEET_HEADERS.index("date_added")
-                    values[pos] = str(old[date_added_idx])
-                except ValueError:
-                    pass
+    for new in rows:
+        cert = new["Certificate Number"]
+        ridx = index_by_cert.get(cert)
+        if ridx is not None:
+            raw = existing[ridx - 1]
+            old = {c: _cell(raw, idx, c) for c in INVENTORY_COLUMNS}
+            merged = merge_row(new, old)
+            if merged is None:
+                counts["unchanged"] += 1
+                continue
+            values = list(raw) + [""] * max(0, len(header) - len(raw))   # keep unknown columns intact
+            for c in INVENTORY_COLUMNS:
+                if c in idx:
+                    values[idx[c]] = merged[c]
             batch_data.append({"range": f"A{ridx}", "values": [values]})
+            counts["updated"] += 1
         else:
+            merged = merge_row(new, None)
+            values = [""] * len(header)
+            for c in INVENTORY_COLUMNS:
+                if c in idx:
+                    values[idx[c]] = merged[c]
             to_append.append(values)
-            index_by_cert[cert] = -1
+            counts["inserted"] += 1
 
-    # One API call for all updates
     if batch_data:
-        _sheets_api_call(
-            lambda: ws.batch_update(batch_data, value_input_option="USER_ENTERED")
-        )
-
+        _sheets_api_call(lambda: ws.batch_update(batch_data, value_input_option="RAW"))
     if to_append:
-        _sheets_api_call(
-            lambda: ws.append_rows(
-                to_append,
-                value_input_option="USER_ENTERED",
-                table_range="A1",
+        _sheets_api_call(lambda: ws.append_rows(to_append, value_input_option="RAW", table_range="A1"))
+    return counts
+
+
+def _upsert_rows_sqlite(rows: List[Dict[str, str]]) -> Dict[str, int]:
+    counts = {"inserted": 0, "updated": 0, "unchanged": 0}
+    col_list = ", ".join(DB_COLUMNS)
+    placeholders = ", ".join(f":{c}" for c in DB_COLUMNS)
+    with db() as conn:
+        for new in rows:
+            cert = new["Certificate Number"]
+            r = conn.execute("SELECT * FROM inventory WHERE certificate_number = ?", (cert,)).fetchone()
+            old = None
+            if r is not None:
+                old = {c: r[DB_COLUMN_MAP[c]] for c in INVENTORY_COLUMNS}
+            merged = merge_row(new, old)
+            if merged is None:
+                counts["unchanged"] += 1
+                continue
+            conn.execute(
+                f"INSERT OR REPLACE INTO inventory ({col_list}) VALUES ({placeholders})",
+                {DB_COLUMN_MAP[c]: merged[c] for c in INVENTORY_COLUMNS},
             )
+            counts["updated" if old is not None else "inserted"] += 1
+    return counts
+
+
+def upsert_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Insert or merge rows. Returns a result dict:
+      inserted / updated / unchanged / skipped (no valid certificate number),
+      warning (str | None)  – set when data was NOT written to the primary store,
+      local_only (bool)     – True when only the local SQLite copy was written.
+    """
+    result: Dict[str, Any] = {
+        "inserted": 0, "updated": 0, "unchanged": 0, "skipped": 0,
+        "warning": None, "local_only": False,
+    }
+    valid, result["skipped"] = _collapse_batch(rows)
+    if not valid:
+        return result
+
+    if not use_gsheets():
+        result.update(_upsert_rows_sqlite(valid))
+        clear_inventory_cache()
+        return result
+
+    try:
+        result.update(_upsert_rows_gsheets(valid))
+        clear_inventory_cache()
+        return result
+    except Exception as e:
+        detail = _gspread_error_detail(e)
+        logger.exception("Google Sheets upsert failed")
+        sqlite_ok = False
+        try:
+            _upsert_rows_sqlite(valid)
+            sqlite_ok = True
+        except Exception:
+            logger.exception("SQLite fallback also failed")
+        hint = " A local copy was kept, but it will NOT sync back to the sheet automatically." if sqlite_ok else ""
+        low = detail.lower()
+        if "429" in detail or "quota" in low:
+            msg = "Google Sheets write quota exceeded. Wait 1–2 minutes, then save a smaller batch." + hint
+            if sqlite_ok:
+                result.update(warning=msg, local_only=True, inserted=0, updated=0)
+                return result
+            raise RuntimeError(msg) from e
+        if "403" in detail or "permission" in low:
+            raise RuntimeError(
+                "Google Sheets permission error. Share the spreadsheet with the service account as Editor." + hint
+            ) from e
+        if "404" in detail or "not found" in low:
+            raise RuntimeError(
+                "Google Sheet not found. Check spreadsheet_id / worksheet_name in secrets." + hint
+            ) from e
+        raise RuntimeError(f"Google Sheets save failed: {detail}" + hint) from e
+
+
+def report_upsert(res: Dict[str, Any]) -> None:
+    """Render an honest status line for an upsert result."""
+    if res.get("warning"):
+        st.warning(res["warning"])
+        return
+    n_in, n_up = res.get("inserted", 0), res.get("updated", 0)
+    parts = []
+    if n_in:
+        parts.append(f"{n_in} added")
+    if n_up:
+        parts.append(f"{n_up} updated")
+    if res.get("unchanged"):
+        parts.append(f"{res['unchanged']} unchanged")
+    if parts:
+        st.success("Saved: " + ", ".join(parts) + ".")
+    if res.get("skipped"):
+        st.warning(
+            f"{res['skipped']} row(s) not saved because no certificate number could be determined."
         )
 
 
-def _upsert_rows_sqlite(rows: List[Dict[str, Any]]):
-    conn = get_conn()
-    cur = conn.cursor()
-    for row in rows:
-        cert = (row.get("Certificate Number") or "").strip()
-        if not cert:
-            continue
-        existing = cur.execute(
-            "SELECT fgi_item_number, date_shipped_from_india, for_stock_or_customer, "
-            "production_order, current_location_status, price_per_carat, price_for_stone, "
-            "comment, date_added FROM inventory WHERE certificate_number = ?",
-            (cert,)
-        ).fetchone()
-
-        d = row_to_db_dict(row)
-        if existing:
-            (fgi, shipped, stock, po, loc, ppc, pfs, comment, date_added) = existing
-            if fgi:
-                d["fgi_item_number"] = fgi
-            if shipped:
-                d["date_shipped_from_india"] = shipped
-            if stock:
-                d["for_stock_or_customer"] = stock
-            if po:
-                d["production_order"] = po
-            if loc:
-                d["current_location_status"] = loc
-            if ppc:
-                d["price_per_carat"] = ppc
-            if pfs:
-                d["price_for_stone"] = pfs
-            if comment:
-                d["comment"] = comment
-            d["date_added"] = date_added
-
-        cur.execute("""
-            INSERT INTO inventory (
-                certificate_number, description, shape_and_cut, carat_weight, color_grade,
-                clarity_grade, measurements, cut_grade, polish, symmetry, fluorescence,
-                process, fgi_item_number, date_shipped_from_india, for_stock_or_customer,
-                production_order, current_location_status, price_per_carat, price_for_stone,
-                certificate_link, comment, lab, status, notes, date_added, last_updated
-            ) VALUES (
-                :certificate_number, :description, :shape_and_cut, :carat_weight, :color_grade,
-                :clarity_grade, :measurements, :cut_grade, :polish, :symmetry, :fluorescence,
-                :process, :fgi_item_number, :date_shipped_from_india, :for_stock_or_customer,
-                :production_order, :current_location_status, :price_per_carat, :price_for_stone,
-                :certificate_link, :comment, :lab, :status, :notes, :date_added, :last_updated
-            )
-            ON CONFLICT(certificate_number) DO UPDATE SET
-                description=excluded.description,
-                shape_and_cut=excluded.shape_and_cut,
-                carat_weight=excluded.carat_weight,
-                color_grade=excluded.color_grade,
-                clarity_grade=excluded.clarity_grade,
-                measurements=excluded.measurements,
-                cut_grade=excluded.cut_grade,
-                polish=excluded.polish,
-                symmetry=excluded.symmetry,
-                fluorescence=excluded.fluorescence,
-                process=excluded.process,
-                fgi_item_number=excluded.fgi_item_number,
-                date_shipped_from_india=excluded.date_shipped_from_india,
-                for_stock_or_customer=excluded.for_stock_or_customer,
-                production_order=excluded.production_order,
-                current_location_status=excluded.current_location_status,
-                price_per_carat=excluded.price_per_carat,
-                price_for_stone=excluded.price_for_stone,
-                certificate_link=excluded.certificate_link,
-                comment=excluded.comment,
-                lab=excluded.lab,
-                status=excluded.status,
-                notes=excluded.notes,
-                last_updated=excluded.last_updated
-        """, d)
-    conn.commit()
-    conn.close()
-
-
+# ---------------- Reads ----------------
 @st.cache_data(ttl=90, show_spinner=False)
 def _load_gsheets_inventory() -> pd.DataFrame:
     """Cached read from Google Sheets (90s) to stay under API quota."""
-    records = _sheet_records()
-    if not records:
-        return pd.DataFrame(columns=INVENTORY_COLUMNS)
-    df = pd.DataFrame(records)
+    return _sheet_frame()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_sqlite_inventory() -> pd.DataFrame:
+    with db() as conn:
+        raw = pd.read_sql_query("SELECT * FROM inventory ORDER BY date_added DESC", conn)
+    inv = {v: k for k, v in DB_COLUMN_MAP.items()}
+    df = raw.rename(columns=inv)
     for c in INVENTORY_COLUMNS:
         if c not in df.columns:
             df[c] = ""
-    return df[INVENTORY_COLUMNS]
+    return df[INVENTORY_COLUMNS].fillna("").astype(str)
 
 
 def _normalize_lab_column(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure Lab is filled from certificate number when blank."""
     if df is None or df.empty:
         return df
-    if "Lab" not in df.columns:
-        df["Lab"] = ""
-    if "Certificate Number" in df.columns:
-        df["Lab"] = [
-            infer_lab(cert, lab)
-            for cert, lab in zip(df["Certificate Number"], df["Lab"])
-        ]
+    df = df.copy()
+    df["Lab"] = [infer_lab(cert, lab) for cert, lab in zip(df["Certificate Number"], df["Lab"])]
     return df
 
 
@@ -623,127 +771,134 @@ def load_all_inventory() -> pd.DataFrame:
         try:
             return _normalize_lab_column(_load_gsheets_inventory())
         except Exception as e:
-            # Don't spam errors on quota – show once-friendly message
+            logger.exception("Inventory load failed")
             msg = str(e)
             if "429" in msg or "Quota" in msg:
                 st.warning("Data service is temporarily busy. Please try again shortly.")
             else:
                 st.error("Unable to load inventory data.")
             return pd.DataFrame(columns=INVENTORY_COLUMNS)
-
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM inventory ORDER BY date_added DESC", conn)
-    conn.close()
-    if df.empty:
-        return pd.DataFrame(columns=INVENTORY_COLUMNS)
-    rows = [db_dict_to_row(r) for r in df.to_dict(orient="records")]
-    return _normalize_lab_column(pd.DataFrame(rows))
+    df = _load_sqlite_inventory()
+    return _normalize_lab_column(df) if not df.empty else pd.DataFrame(columns=INVENTORY_COLUMNS)
 
 
 def clear_inventory_cache():
     """Call after any write so the next read is fresh."""
-    try:
-        _load_gsheets_inventory.clear()
-    except Exception:
-        pass
+    for fn in (_load_gsheets_inventory, _load_sqlite_inventory):
+        try:
+            fn.clear()
+        except Exception:
+            logger.debug("cache clear failed", exc_info=True)
 
 
-def update_editable_fields(df_edit: pd.DataFrame):
-    """Save only the editable columns for existing certificates."""
-    if use_gsheets():
-        _update_editable_gsheets(df_edit)
-        clear_inventory_cache()
-    else:
-        _update_editable_sqlite(df_edit)
-
-
-def _update_editable_gsheets(df_edit: pd.DataFrame):
-    """Batch-update editable fields (far fewer API calls than update_cell)."""
-    import gspread
-    ws = _open_worksheet()
-    existing = ws.get_all_values()
-    if len(existing) < 2:
-        return
-    header = existing[0]
-    try:
-        cert_col = header.index("Certificate Number")
-    except ValueError:
-        return
-
-    index_by_cert = {}
-    for i, row in enumerate(existing[1:], start=2):
-        if len(row) > cert_col and row[cert_col]:
-            index_by_cert[row[cert_col].strip()] = i
-
-    now = datetime.now().isoformat(timespec="seconds")
-    cells = []
-    for _, row in df_edit.iterrows():
-        cert = str(row.get("Certificate Number", "")).strip()
-        if not cert or cert not in index_by_cert:
-            continue
-        ridx = index_by_cert[cert]
-        for name in EDITABLE_COLUMNS:
-            if name not in header:
-                continue
-            cidx = header.index(name) + 1
-            val = str(row.get(name) or "")
-            cells.append(gspread.Cell(ridx, cidx, val))
-        if "last_updated" in header:
-            cells.append(gspread.Cell(ridx, header.index("last_updated") + 1, now))
-
-    if cells:
-        ws.update_cells(cells, value_input_option="USER_ENTERED")
-
-
-def _update_editable_sqlite(df_edit: pd.DataFrame):
-    conn = get_conn()
-    cur = conn.cursor()
-    now = datetime.now().isoformat(timespec="seconds")
-    for _, row in df_edit.iterrows():
-        cert = str(row.get("Certificate Number", "")).strip()
-        if not cert:
-            continue
-        cur.execute("""
-            UPDATE inventory SET
-                fgi_item_number = ?,
-                date_shipped_from_india = ?,
-                for_stock_or_customer = ?,
-                production_order = ?,
-                current_location_status = ?,
-                price_per_carat = ?,
-                price_for_stone = ?,
-                comment = ?,
-                last_updated = ?
-            WHERE certificate_number = ?
-        """, (
-            str(row.get("FGI Item Number") or ""),
-            str(row.get("Date Shipped from India") or ""),
-            str(row.get("For stock or Customer") or ""),
-            str(row.get("Production Order #, if for stock") or ""),
-            str(row.get("Current Location/Status") or ""),
-            str(row.get("Price Per Carat") or ""),
-            str(row.get("Price For stone") or ""),
-            str(row.get("Comment") or ""),
-            now,
-            cert,
-        ))
-    conn.commit()
-    conn.close()
-
-
-def count_added_today() -> int:
-    today = date.today().isoformat()
-    df = load_all_inventory()
+def count_added_today(df: Optional[pd.DataFrame] = None) -> int:
+    df = load_all_inventory() if df is None else df
     if df.empty or "date_added" not in df.columns:
         return 0
-    return int(df["date_added"].astype(str).str.startswith(today).sum())
+    return int(df["date_added"].astype(str).str.startswith(date.today().isoformat()).sum())
 
 
-def total_count() -> int:
-    df = load_all_inventory()
-    return len(df)
+# ---------------- Edit tab: diff-based save with conflict detection ----------------
+Changes = Dict[str, Dict[str, Tuple[str, str]]]   # cert -> {column: (old, new)}
 
 
+def compute_edit_changes(original: pd.DataFrame, edited: pd.DataFrame) -> Changes:
+    """Cells whose editable value differs between the table as loaded and as edited."""
+    if original.empty or edited.empty:
+        return {}
+    orig = {
+        _s(r["Certificate Number"]): r
+        for r in original.to_dict("records") if _s(r.get("Certificate Number"))
+    }
+    changes: Changes = {}
+    for r in edited.to_dict("records"):
+        cert = _s(r.get("Certificate Number"))
+        o = orig.get(cert)
+        if not cert or o is None:
+            continue
+        for col in EDITABLE_COLUMNS:
+            if col not in r:
+                continue
+            old, new = _s(o.get(col)), _s(r.get(col))
+            if old != new:
+                changes.setdefault(cert, {})[col] = (old, new)
+    return changes
+
+
+def update_editable_fields(changes: Changes) -> Dict[str, Any]:
+    """
+    Write only the changed editable cells. A cell is skipped as a CONFLICT when
+    someone else changed it since this table was loaded (current value is
+    neither the old nor the new value).
+    Returns {"updated": n_cells, "conflicts": [(cert, column), ...]}.
+    """
+    out: Dict[str, Any] = {"updated": 0, "conflicts": []}
+    if not changes:
+        return out
+    now = _now()
+
+    if use_gsheets():
+        import gspread
+        ws = _open_worksheet()
+        header = _ensure_sheet_headers(ws)
+        existing = _sheets_api_call(lambda: ws.get_all_values())
+        idx = _header_index(header)
+        rows_by_cert: Dict[str, int] = {}
+        for i, raw in enumerate(existing[1:], start=2):
+            c = _cell(raw, idx, "Certificate Number")
+            if c:
+                rows_by_cert.setdefault(c, i)
+        cells, touched = [], set()
+        for cert, cols in changes.items():
+            ridx = rows_by_cert.get(cert)
+            if ridx is None:
+                out["conflicts"].append((cert, "(row no longer exists)"))
+                continue
+            raw = existing[ridx - 1]
+            for col, (old, new) in cols.items():
+                if col not in idx:
+                    continue
+                current = _cell(raw, idx, col)
+                if current != old and current != new:
+                    out["conflicts"].append((cert, col))
+                    continue
+                cells.append(gspread.Cell(ridx, idx[col] + 1, new))
+                touched.add(ridx)
+                out["updated"] += 1
+        for ridx in touched:
+            cells.append(gspread.Cell(ridx, idx["last_updated"] + 1, now))
+        if cells:
+            _sheets_api_call(lambda: ws.update_cells(cells, value_input_option="RAW"))
+    else:
+        with db() as conn:
+            for cert, cols in changes.items():
+                r = conn.execute("SELECT * FROM inventory WHERE certificate_number = ?", (cert,)).fetchone()
+                if r is None:
+                    out["conflicts"].append((cert, "(row no longer exists)"))
+                    continue
+                sets, params = [], {}
+                for col, (old, new) in cols.items():
+                    dbc = DB_COLUMN_MAP[col]            # whitelisted via EDITABLE_COLUMNS
+                    current = _s(r[dbc])
+                    if current != old and current != new:
+                        out["conflicts"].append((cert, col))
+                        continue
+                    sets.append(f"{dbc} = :{dbc}")
+                    params[dbc] = new
+                    out["updated"] += 1
+                if sets:
+                    params["_cert"], params["_now"] = cert, now
+                    conn.execute(
+                        f"UPDATE inventory SET {', '.join(sets)}, last_updated = :_now "
+                        f"WHERE certificate_number = :_cert", params,
+                    )
+    clear_inventory_cache()
+    return out
+
+
+# -------------------------------------------------
+# Inventory helpers (unchanged)
+# -------------------------------------------------
 def _parse_carat(val) -> float:
     try:
         m = re.search(r"[\d.]+", str(val))
@@ -800,7 +955,354 @@ def inventory_subtotals(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: bool = True):
+# -------------------------------------------------
+# Certificate download / ZIP / preview
+# -------------------------------------------------
+def resolve_certificate_pdf_url(cert: str, cert_link: str = "") -> Optional[str]:
+    """Build best-effort public PDF URL for a certificate."""
+    cert = str(cert or "").strip()
+    link = str(cert_link or "").strip()
+    if link and (".pdf" in link.lower() or "pdf.igi.org" in link.lower() or "pdf.gia.edu" in link.lower()):
+        return link
+    if is_igi(cert):
+        number_only = re.sub(r"^LG", "", cert, flags=re.I)
+        return f"https://pdf.igi.org/FDR{number_only}.pdf"
+    if link.startswith("http"):
+        return link
+    return None
+
+
+def download_certificate_pdf(cert: str, cert_link: str = "") -> Dict[str, Any]:
+    """Download certificate PDF bytes. Handles IGI FDR URLs and GIA token pages.
+    Only hosts in CERT_ALLOWED_HOST_SUFFIXES are contacted (including redirects)."""
+    url = resolve_certificate_pdf_url(cert, cert_link)
+    if not url:
+        return {"success": False, "error": "No PDF URL available for this certificate"}
+    hdrs = {"Accept": "application/pdf,*/*"}
+    try:
+        resp = safe_get(url, allowed_host_suffixes=CERT_ALLOWED_HOST_SUFFIXES,
+                        stream=True, timeout=40, headers=hdrs)
+        if resp.status_code == 404:
+            resp.close()
+            return {"success": False, "error": "PDF not found (404) on lab server"}
+        if resp.status_code != 200:
+            code = resp.status_code
+            resp.close()
+            return {"success": False, "error": f"HTTP {code}"}
+
+        ct = (resp.headers.get("Content-Type") or "").lower()
+        content = read_capped(resp, MAX_PDF_BYTES)
+
+        # GIA token pages return HTML that redirects to an S3 PDF
+        if "pdf" not in ct and content[:4] != b"%PDF":
+            html = content.decode("utf-8", errors="ignore")
+            m = re.search(r'https://[^"\']+\.pdf[^"\']*', html)
+            if not m:
+                m = re.search(r'window\.location\s*=\s*\(\s*["\'](https://[^"\']+)["\']', html)
+            if not m:
+                return {"success": False, "error": "Response is not a PDF"}
+            pdf_url = m.group(1) if m.lastindex else m.group(0)
+            r2 = safe_get(pdf_url, allowed_host_suffixes=CERT_ALLOWED_HOST_SUFFIXES,
+                          stream=True, timeout=40, headers=hdrs)
+            if r2.status_code != 200:
+                r2.close()
+                return {"success": False, "error": "Could not download redirected PDF"}
+            content = read_capped(r2, MAX_PDF_BYTES)
+
+        if content[:4] != b"%PDF":
+            return {"success": False, "error": "Downloaded file is not a valid PDF"}
+        return {"success": True, "pdf_bytes": content, "source_url": url}
+    except UnsafeURL as e:
+        return {"success": False, "error": f"Blocked: {e}"}
+    except Exception as e:
+        logger.warning("Certificate download failed for %s: %s", cert, e)
+        return {"success": False, "error": str(e)[:200]}
+
+
+@st.cache_data(ttl=900, show_spinner=False, max_entries=64)
+def _download_pdf_cached(cert: str, link: str) -> bytes:
+    dl = download_certificate_pdf(cert, link)
+    if not dl.get("success"):
+        raise RuntimeError(dl.get("error", "download failed"))   # failures are not cached
+    return dl["pdf_bytes"]
+
+
+def get_certificate_pdf(cert: str, cert_link: str = "") -> Dict[str, Any]:
+    """Cached wrapper (15 min) used by the preview and Drive backup."""
+    try:
+        return {"success": True, "pdf_bytes": _download_pdf_cached(str(cert), str(cert_link or ""))}
+    except RuntimeError as e:
+        return {"success": False, "error": str(e)}
+
+
+def build_certificates_zip(
+    df: pd.DataFrame,
+    max_files: int = 80,
+    workers: int = 5,
+) -> Tuple[Optional[bytes], List[Dict[str, str]]]:
+    """
+    Download certificate PDFs for rows in df (in parallel) and pack into a ZIP.
+    Returns (zip_bytes or None, status log rows).
+    """
+    if df is None or df.empty:
+        return None, []
+
+    jobs = []
+    for _, row in df.head(max_files).iterrows():
+        cert = _s(row.get("Certificate Number"))
+        if cert:
+            jobs.append((cert, _s(row.get("CERTIFICATE LINK"))))
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        downloads = list(pool.map(lambda j: download_certificate_pdf(*j), jobs))
+
+    logs: List[Dict[str, str]] = []
+    buf = io.BytesIO()
+    ok_count = 0
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for (cert, _link), dl in zip(jobs, downloads):
+            if dl.get("success") and dl.get("pdf_bytes"):
+                zf.writestr(f"{_safe_name(cert)}_certificate.pdf", dl["pdf_bytes"])
+                ok_count += 1
+                logs.append({"Certificate": cert, "Status": "OK"})
+            else:
+                logs.append({
+                    "Certificate": cert, "Status": "Failed",
+                    "Note": str(dl.get("error") or "download failed")[:120],
+                })
+    if ok_count == 0:
+        return None, logs
+    return buf.getvalue(), logs
+
+
+def pdf_to_preview_images(pdf_bytes: bytes, max_pages: int = 2, scale: float = 1.5) -> List[Any]:
+    """Render PDF pages to PIL images for in-app preview."""
+    images = []
+    try:
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(pdf_bytes)
+        for i in range(min(len(doc), max_pages)):
+            images.append(doc[i].render(scale=scale).to_pil())
+        return images
+    except Exception:
+        logger.debug("pypdfium2 render failed", exc_info=True)
+    # Fallback: text-only card via pdfplumber
+    try:
+        from PIL import Image, ImageDraw
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages[:max_pages]:
+                txt = (page.extract_text() or "")[:1200]
+                img = Image.new("RGB", (900, 1200), "white")
+                draw = ImageDraw.Draw(img)
+                y = 20
+                for line in txt.splitlines()[:50]:
+                    draw.text((20, y), line[:90], fill="black")
+                    y += 18
+                images.append(img)
+        return images
+    except Exception:
+        logger.debug("pdfplumber fallback render failed", exc_info=True)
+        return []
+
+
+# -------------------------------------------------
+# Google Drive
+# -------------------------------------------------
+def upload_fileobj_to_drive(filename: str, fileobj, mime: str = "application/pdf") -> Dict[str, Any]:
+    """Upload a seekable file object to the configured Drive folder (private by default)."""
+    if not _has_gdrive_folder():
+        return {"success": False, "error": "Drive folder_id not configured in secrets"}
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        folder_id = str(st.secrets["drive"]["folder_id"]).strip()
+        if not folder_id:
+            return {"success": False, "error": "drive.folder_id is empty in secrets"}
+        service = _get_drive_service()
+        media = MediaIoBaseUpload(fileobj, mimetype=mime, resumable=True)
+        f = (
+            service.files()
+            .create(body={"name": filename, "parents": [folder_id]}, media_body=media,
+                    fields="id,webViewLink", supportsAllDrives=True)
+            .execute()
+        )
+        if _drive_public_link_enabled():
+            try:
+                service.permissions().create(
+                    fileId=f["id"], body={"type": "anyone", "role": "reader"}, supportsAllDrives=True,
+                ).execute()
+            except Exception:
+                logger.warning("Could not set public link permission", exc_info=True)
+        link = f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view"
+        return {"success": True, "drive_link": link, "file_id": f["id"], "filename": filename}
+    except Exception as e:
+        logger.exception("Drive upload failed")
+        err = str(e)
+        if "File not found" in err or "404" in err:
+            err += " — Check folder_id and that the folder is shared with the service account as Editor."
+        if "googleapiclient" in err or "No module" in err:
+            err += " — Add google-api-python-client to requirements.txt and reboot the app."
+        return {"success": False, "error": err[:400]}
+
+
+def upload_bytes_to_drive(filename: str, data: bytes, mime: str = "application/pdf") -> Dict[str, Any]:
+    return upload_fileobj_to_drive(filename, io.BytesIO(data), mime)
+
+
+def backup_certificate_pdf_to_drive(cert: str, cert_link: str = "") -> Dict[str, Any]:
+    """Download lab PDF and store a permanent copy on Google Drive."""
+    try:
+        dl = get_certificate_pdf(cert, cert_link)
+        if not dl.get("success"):
+            return {"success": False, "error": f"Download failed: {dl.get('error', 'unknown')}"}
+        filename = f"{_safe_name(cert)}_certificate.pdf"
+        return upload_bytes_to_drive(filename, dl["pdf_bytes"], "application/pdf")
+    except Exception as e:
+        logger.exception("Backup failed")
+        return {"success": False, "error": f"Backup error: {str(e)[:300]}"}
+
+
+# -------------------------------------------------
+# Video links
+# -------------------------------------------------
+def _read_head(resp: requests.Response, n: int) -> bytes:
+    buf = bytearray()
+    for chunk in resp.iter_content(chunk_size=65536):
+        buf.extend(chunk)
+        if len(buf) >= n:
+            break
+    return bytes(buf[:n])
+
+
+def probe_video_url(url: str) -> Dict[str, Any]:
+    """Check (without downloading the body) whether a URL is a direct video, or
+    find an mp4 inside an HTML page."""
+    try:
+        r = safe_get(url, stream=True, timeout=20)
+        try:
+            ct = (r.headers.get("Content-Type") or "").lower()
+            size = r.headers.get("Content-Length")
+            final = r.url
+            ok = r.status_code == 200
+            is_video = ("video/" in ct) or final.lower().endswith((".mp4", ".webm", ".mov"))
+            found_mp4 = None
+            if ok and "html" in ct:
+                text = _read_head(r, 1_000_000).decode("utf-8", errors="ignore")
+                mp4s = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', text, flags=re.I)
+                if mp4s:
+                    found_mp4 = mp4s[0].replace("&amp;", "&")
+                    is_video = True
+                    final = found_mp4
+        finally:
+            r.close()
+        return {
+            "ok": ok, "status": r.status_code, "content_type": ct,
+            "size": int(size) if size and str(size).isdigit() else None,
+            "is_direct_video": bool(is_video and ok),
+            "final_url": final, "extracted_mp4": found_mp4,
+        }
+    except Exception as e:
+        return {
+            "ok": False, "status": 0, "content_type": "", "size": None,
+            "is_direct_video": False, "final_url": url, "error": str(e),
+        }
+
+
+def download_and_upload_video_to_drive(cert: str, url: str) -> Dict[str, Any]:
+    """Stream a direct video file (size-capped, via a temp file) to the Drive folder."""
+    if not _has_gdrive_folder():
+        return {"success": False, "error": "Drive folder_id not configured in secrets"}
+
+    probe = probe_video_url(url)
+    if probe.get("error"):
+        return {"success": False, "error": f"Could not reach URL: {probe['error'][:150]}"}
+    if not probe.get("is_direct_video"):
+        return {
+            "success": False,
+            "error": f"Not a direct video file (type={probe.get('content_type') or 'unknown'}). "
+                     "Vision360/DNA HTML cannot be converted to MP4 automatically.",
+            "link_saved_only": True,
+        }
+    if probe.get("size") and probe["size"] > MAX_VIDEO_BYTES:
+        return {"success": False, "error": f"Video larger than {MAX_VIDEO_BYTES // (1024 * 1024)} MB limit"}
+
+    import tempfile
+    download_url = probe.get("extracted_mp4") or probe.get("final_url") or url
+    try:
+        r = safe_get(download_url, stream=True, timeout=60)
+        if r.status_code != 200:
+            code = r.status_code
+            r.close()
+            return {"success": False, "error": f"Download HTTP {code}"}
+        ct = (r.headers.get("Content-Type") or "").lower()
+        ext = ".webm" if "webm" in ct else (".mov" if ("quicktime" in ct or "mov" in ct) else ".mp4")
+        total = 0
+        with tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024) as tmp:
+            for chunk in r.iter_content(chunk_size=1024 * 512):
+                total += len(chunk)
+                if total > MAX_VIDEO_BYTES:
+                    r.close()
+                    return {"success": False, "error": f"Video exceeds {MAX_VIDEO_BYTES // (1024 * 1024)} MB limit"}
+                tmp.write(chunk)
+            tmp.seek(0)
+            return upload_fileobj_to_drive(f"{cert}_video{ext}", tmp, ct if "video" in ct else "video/mp4")
+    except UnsafeURL as e:
+        return {"success": False, "error": f"Blocked: {e}"}
+    except Exception as e:
+        logger.exception("Video backup failed")
+        return {"success": False, "error": str(e)[:200]}
+
+
+def save_video_urls(pairs: List[tuple], try_drive_backup: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    pairs: list of (certificate_number, video_url)
+    Updates inventory Video URL (new URL replaces the old); optionally backs up
+    direct videos to Drive. Returns (per-item results, upsert result).
+    """
+    results: List[Dict[str, Any]] = []
+    existing = load_all_inventory()
+    existing_map: Dict[str, Dict[str, Any]] = {}
+    if not existing.empty:
+        for r in existing.to_dict("records"):
+            existing_map[_s(r["Certificate Number"])] = r
+
+    to_upsert = []
+    for cert, url in pairs:
+        cert, url = str(cert).strip(), str(url).strip()
+        if not _valid_cert(cert) or not url:
+            continue
+        if not url.lower().startswith(("http://", "https://")):
+            results.append({"Certificate Number": cert, "Video URL": url, "backup": "rejected (not an http/https URL)"})
+            continue
+        row = dict(existing_map.get(cert) or empty_inventory_row(cert, infer_lab(cert)))
+        if cert not in existing_map:
+            row["Status"] = "Media only"
+        row["Certificate Number"] = cert
+        row["Lab"] = infer_lab(cert, row.get("Lab") or "")
+        row["Video URL"] = url
+        info = {"Certificate Number": cert, "Video URL": url, "backup": "skipped"}
+
+        if try_drive_backup and _has_gdrive_folder():
+            up = download_and_upload_video_to_drive(cert, url)
+            if up.get("success"):
+                row["Video Backup Drive Link"] = up["drive_link"]
+                info.update(backup="uploaded", **{"Video Backup Drive Link": up["drive_link"]})
+            elif up.get("link_saved_only"):
+                info.update(backup="link only (not direct video)", note=up.get("error", ""))
+            else:
+                info.update(backup="failed", note=up.get("error", ""))
+        else:
+            info["backup"] = "link saved (Drive not configured or disabled)"
+        to_upsert.append(row)
+        results.append(info)
+
+    res = upsert_rows(to_upsert) if to_upsert else {"inserted": 0, "updated": 0, "unchanged": 0, "skipped": 0, "warning": None}
+    return results, res
+
+
+# -------------------------------------------------
+# Certificate preview (dialog)
+# -------------------------------------------------
+def render_certificate_preview(cert: str, cert_link: str = ""):
     """Overlay: certificate image first, then compact specs and actions."""
     cert = str(cert or "").strip()
     if not cert:
@@ -809,12 +1311,11 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
     link = cert_link
     backup_link = ""
     match_row = None
-    if not existing.empty and "Certificate Number" in existing.columns:
+    if not existing.empty:
         match = existing[existing["Certificate Number"].astype(str) == cert]
         if not match.empty:
             match_row = match.iloc[0].to_dict()
-            if not link:
-                link = str(match_row.get("CERTIFICATE LINK") or "")
+            link = link or str(match_row.get("CERTIFICATE LINK") or "")
             backup_link = str(match_row.get("Certificate PDF Backup Drive Link") or "").strip()
 
     def _v(key, default="—"):
@@ -823,80 +1324,73 @@ def render_certificate_preview(cert: str, cert_link: str = "", show_backup_btn: 
         val = match_row.get(key)
         return str(val) if val not in (None, "") else default
 
-    # 1) Certificate image first (no long text above)
     with st.spinner("Loading certificate…"):
-        dl = download_certificate_pdf(cert, link)
+        dl = get_certificate_pdf(cert, link)
     pdf_bytes = dl.get("pdf_bytes") if dl.get("success") else None
     if pdf_bytes:
         images = pdf_to_preview_images(pdf_bytes, max_pages=1, scale=1.6)
         if images:
-            st.image(images[0], use_container_width=True)
+            st.image(images[0], **_STRETCH)
         st.download_button(
-            "Download PDF",
-            data=pdf_bytes,
-            file_name=f"{cert}_certificate.pdf",
-            mime="application/pdf",
-            key=f"prev_dl_{cert}",
+            "Download PDF", data=pdf_bytes, file_name=f"{cert}_certificate.pdf",
+            mime="application/pdf", key=f"prev_dl_{cert}",
         )
     else:
-        st.warning(dl.get("error", "Certificate file is not available.") if dl else "Certificate file is not available.")
+        st.warning(dl.get("error", "Certificate file is not available."))
 
-    # 2) One compact summary line (not a long description block)
     st.caption(
         f"{_v('Lab')} · {_v('SHAPE AND CUT')} · {_v('CARAT WEIGHT')} · "
         f"{_v('COLOR GRADE')} / {_v('CLARITY GRADE')} · {_v('MEASUREMENTS')} · {_v('Process')}"
     )
 
-    # 3) Actions
     c1, c2, c3 = st.columns(3)
     with c1:
-        do_backup = st.button(
-            "Save PDF copy",
-            key=f"prev_bak_{cert}",
-            disabled=not _has_gdrive_folder(),
-        )
+        do_backup = st.button("Save PDF copy", key=f"prev_bak_{cert}", disabled=not _has_gdrive_folder())
     with c2:
         if link:
-            st.link_button("Open report", link, use_container_width=True)
+            st.link_button("Open report", link, **_STRETCH)
     with c3:
         if backup_link:
-            st.link_button("Saved copy", backup_link, use_container_width=True)
+            st.link_button("Saved copy", backup_link, **_STRETCH)
 
     if do_backup and _has_gdrive_folder():
         with st.spinner("Saving certificate…"):
             res = backup_certificate_pdf_to_drive(cert, link)
         if res.get("success"):
-            row = match_row or empty_inventory_row(cert, infer_lab(cert))
+            row = dict(match_row or empty_inventory_row(cert, infer_lab(cert)))
+            if not match_row:
+                row["Status"] = "Link only"
             row["Certificate Number"] = cert
             row["Certificate PDF Backup Drive Link"] = res["drive_link"]
             if link:
                 row["CERTIFICATE LINK"] = link
-            upsert_rows([row])
-            st.success("Certificate copy saved.")
+            report_upsert(upsert_rows([row]))
         else:
             st.error(res.get("error", "Unable to save certificate copy."))
 
 
-# Modal popup when Streamlit supports st.dialog
-try:
-    @st.dialog("Certificate preview", width="large")
-    def certificate_preview_dialog(cert: str, cert_link: str = ""):
-        render_certificate_preview(cert, cert_link)
-    HAS_DIALOG = True
-except Exception:
-    HAS_DIALOG = False
+@st.dialog("Certificate preview", width="large")
+def certificate_preview_dialog(cert: str, cert_link: str = ""):
+    render_certificate_preview(cert, cert_link)
 
 
 def open_certificate_preview(cert: str, cert_link: str = ""):
-    """Open preview as dialog if available, else store in session for inline panel."""
     cert = str(cert or "").strip()
-    if not cert:
-        return
-    if HAS_DIALOG:
+    if cert:
         certificate_preview_dialog(cert, cert_link)
+
+
+def maybe_open_preview(state_key: str, sel_rows, frame: pd.DataFrame) -> None:
+    """Open the preview dialog once per newly selected row (not on every rerun)."""
+    if sel_rows and sel_rows[0] < len(frame):
+        crow = frame.iloc[sel_rows[0]]
+        cert = _s(crow.get("Certificate Number"))
+        link = _s(crow.get("CERTIFICATE LINK"))
+        if st.session_state.get(state_key) != cert:
+            st.session_state[state_key] = cert
+            open_certificate_preview(cert, link)
     else:
-        st.session_state["inline_preview_cert"] = cert
-        st.session_state["inline_preview_link"] = cert_link or ""
+        st.session_state[state_key] = None
 
 
 def render_inventory_subtotals(df: pd.DataFrame, title: str = "Subtotals", expanded: bool = False):
@@ -921,26 +1415,26 @@ def render_inventory_subtotals(df: pd.DataFrame, title: str = "Subtotals", expan
             if s["by_shape"]:
                 st.dataframe(
                     pd.DataFrame({"Shape": list(s["by_shape"].keys()), "#": list(s["by_shape"].values())}),
-                    hide_index=True, use_container_width=True, height=160,
+                    hide_index=True, **_STRETCH, height=160,
                 )
         with b2:
             if s["by_color"]:
                 st.dataframe(
                     pd.DataFrame({"Color": list(s["by_color"].keys()), "#": list(s["by_color"].values())}),
-                    hide_index=True, use_container_width=True, height=160,
+                    hide_index=True, **_STRETCH, height=160,
                 )
         with b3:
             if s["by_clarity"]:
                 st.dataframe(
                     pd.DataFrame({"Clarity": list(s["by_clarity"].keys()), "#": list(s["by_clarity"].values())}),
-                    hide_index=True, use_container_width=True, height=160,
+                    hide_index=True, **_STRETCH, height=160,
                 )
 
 
 init_db()
 
 # -------------------------------------------------
-# Helper functions
+# Helper functions (unchanged)
 # -------------------------------------------------
 
 def clean_report_number(raw: str) -> str:
@@ -995,6 +1489,7 @@ def infer_lab(cert: str, current_lab: str = "") -> str:
     if is_gia(c):
         return "GIA"
     return lab or "Unknown"
+
 
 
 def extract_text_from_pdf(content: bytes) -> str:
@@ -1072,345 +1567,32 @@ def empty_inventory_row(cert: str = "", lab: str = "") -> Dict[str, Any]:
     }
 
 
-def probe_video_url(url: str) -> Dict[str, Any]:
-    """Check if URL is a direct downloadable video, or find an mp4 inside an HTML page."""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
-        ct = (r.headers.get("Content-Type") or "").lower()
-        size = r.headers.get("Content-Length")
-        final = r.url
-        is_video = ("video/" in ct) or final.lower().endswith((".mp4", ".webm", ".mov"))
-
-        # If HTML page, try to extract a direct .mp4 URL from the source
-        found_mp4 = None
-        if r.status_code == 200 and "html" in ct:
-            mp4s = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', r.text, flags=re.I)
-            if mp4s:
-                found_mp4 = mp4s[0].replace("&amp;", "&")
-                is_video = True
-                final = found_mp4
-
-        return {
-            "ok": r.status_code == 200,
-            "status": r.status_code,
-            "content_type": ct,
-            "size": int(size) if size and str(size).isdigit() else None,
-            "is_direct_video": bool(is_video and r.status_code == 200),
-            "final_url": final,
-            "extracted_mp4": found_mp4,
-        }
-    except Exception as e:
-        return {
-            "ok": False, "status": 0, "content_type": "", "size": None,
-            "is_direct_video": False, "final_url": url, "error": str(e),
-        }
+# -------------------------------------------------
+# PDF parsing (single shared path for IGI / GIA / uploaded PDFs)
+# -------------------------------------------------
+_SEP = r"[\s.:]*"     # GIA pads labels with dot leaders: "Carat Weight ....... 0.50 carat"
+_CLARITY = r"((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))"
 
 
-def download_and_upload_video_to_drive(cert: str, url: str) -> Dict[str, Any]:
-    """
-    Download a direct video file and upload to Google Drive folder.
-    Returns dict with drive_link or error.
-    """
-    if not _has_gdrive_folder():
-        return {"success": False, "error": "Drive folder_id not configured in secrets"}
-
-    probe = probe_video_url(url)
-    if not probe.get("is_direct_video"):
-        return {
-            "success": False,
-            "error": f"Not a direct video file (type={probe.get('content_type') or 'unknown'}). Vision360/DNA HTML cannot be converted to MP4 automatically.",
-            "link_saved_only": True,
-        }
-
-    download_url = probe.get("extracted_mp4") or probe.get("final_url") or url
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(download_url, headers=headers, timeout=180, allow_redirects=True)
-        if r.status_code != 200:
-            return {"success": False, "error": f"Download HTTP {r.status_code}"}
-
-        # Pick extension
-        ct = (r.headers.get("Content-Type") or "").lower()
-        ext = ".mp4"
-        if "webm" in ct:
-            ext = ".webm"
-        elif "quicktime" in ct or "mov" in ct:
-            ext = ".mov"
-
-        filename = f"{cert}_video{ext}"
-        folder_id = st.secrets["drive"]["folder_id"]
-        service = _get_drive_service()
-
-        from googleapiclient.http import MediaIoBaseUpload
-        media = MediaIoBaseUpload(io.BytesIO(r.content), mimetype=ct or "video/mp4", resumable=True)
-        meta = {"name": filename, "parents": [folder_id]}
-        f = service.files().create(body=meta, media_body=media, fields="id,webViewLink,webContentLink").execute()
-
-        # Make readable by link (optional)
-        try:
-            service.permissions().create(
-                fileId=f["id"],
-                body={"type": "anyone", "role": "reader"},
-            ).execute()
-        except Exception:
-            pass
-
-        link = f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view"
-        return {"success": True, "drive_link": link, "file_id": f["id"], "filename": filename}
-    except Exception as e:
-        return {"success": False, "error": str(e)[:200]}
-
-
-def save_video_urls(pairs: List[tuple], try_drive_backup: bool = True) -> List[Dict[str, Any]]:
-    """
-    pairs: list of (certificate_number, video_url)
-    Updates inventory Video URL; optionally backs up direct videos to Drive.
-    """
-    results = []
-    existing = load_all_inventory()
-    existing_map = {}
-    if not existing.empty and "Certificate Number" in existing.columns:
-        for _, row in existing.iterrows():
-            existing_map[str(row["Certificate Number"]).strip()] = row.to_dict()
-
-    to_upsert = []
-    for cert, url in pairs:
-        cert = str(cert).strip()
-        url = str(url).strip()
-        if not cert or not url:
-            continue
-        row = existing_map.get(cert) or empty_inventory_row(cert, infer_lab(cert))
-        row["Certificate Number"] = cert
-        row["Lab"] = infer_lab(cert, row.get("Lab") or "")
-        row["Video URL"] = url
-        info = {"Certificate Number": cert, "Video URL": url, "backup": "skipped"}
-
-        if try_drive_backup and _has_gdrive_folder():
-            up = download_and_upload_video_to_drive(cert, url)
-            if up.get("success"):
-                row["Video Backup Drive Link"] = up["drive_link"]
-                info["backup"] = "uploaded"
-                info["Video Backup Drive Link"] = up["drive_link"]
-            elif up.get("link_saved_only"):
-                info["backup"] = "link only (not direct video)"
-                info["note"] = up.get("error", "")
-            else:
-                info["backup"] = "failed"
-                info["note"] = up.get("error", "")
-        else:
-            info["backup"] = "link saved (Drive not configured or disabled)"
-
-        to_upsert.append(row)
-        results.append(info)
-
-    if to_upsert:
-        upsert_rows(to_upsert)
-    return results
-
-
-def resolve_certificate_pdf_url(cert: str, cert_link: str = "") -> Optional[str]:
-    """Build best-effort public PDF URL for a certificate."""
-    cert = str(cert or "").strip()
-    link = str(cert_link or "").strip()
-    if link and (".pdf" in link.lower() or "pdf.igi.org" in link.lower() or "pdf.gia.edu" in link.lower()):
-        return link
-    if is_igi(cert):
-        number_only = re.sub(r"^LG", "", cert, flags=re.I)
-        return f"https://pdf.igi.org/FDR{number_only}.pdf"
-    if link.startswith("http"):
-        return link
-    return None
-
-
-def build_certificates_zip(
-    df: pd.DataFrame,
-    max_files: int = 80,
-    delay_sec: float = 0.35,
-) -> Tuple[Optional[bytes], List[Dict[str, str]]]:
-    """
-    Download certificate PDFs for rows in df and pack into a ZIP.
-    Returns (zip_bytes or None, status log rows).
-    """
-    if df is None or df.empty:
-        return None, []
-
-    logs: List[Dict[str, str]] = []
-    buf = io.BytesIO()
-    ok_count = 0
-    rows = df.head(max_files)
-
-    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for _, row in rows.iterrows():
-            cert = str(row.get("Certificate Number") or "").strip()
-            link = str(row.get("CERTIFICATE LINK") or "").strip()
-            if not cert:
-                continue
-            dl = download_certificate_pdf(cert, link)
-            if dl.get("success") and dl.get("pdf_bytes"):
-                safe = re.sub(r"[^\w\-]+", "_", cert)
-                zf.writestr(f"{safe}_certificate.pdf", dl["pdf_bytes"])
-                ok_count += 1
-                logs.append({"Certificate": cert, "Status": "OK"})
-            else:
-                logs.append(
-                    {
-                        "Certificate": cert,
-                        "Status": "Failed",
-                        "Note": str(dl.get("error") or "download failed")[:120],
-                    }
-                )
-            time.sleep(delay_sec)
-
-    if ok_count == 0:
-        return None, logs
-    buf.seek(0)
-    return buf.getvalue(), logs
-
-
-def download_certificate_pdf(cert: str, cert_link: str = "") -> Dict[str, Any]:
-    """Download certificate PDF bytes. Handles IGI FDR URLs and GIA token pages."""
-    url = resolve_certificate_pdf_url(cert, cert_link)
-    if not url:
-        return {"success": False, "error": "No PDF URL available for this certificate"}
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/pdf,*/*",
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=40, allow_redirects=True)
-        if resp.status_code == 404:
-            return {"success": False, "error": "PDF not found (404) on lab server"}
-        if resp.status_code != 200:
-            return {"success": False, "error": f"HTTP {resp.status_code}"}
-
-        content = resp.content
-        ct = (resp.headers.get("Content-Type") or "").lower()
-
-        # GIA token pages return HTML that redirects to S3 PDF
-        if "pdf" not in ct and content[:4] != b"%PDF":
-            html = content.decode("utf-8", errors="ignore")
-            m = re.search(r'https://[^"\']+\.pdf[^"\']*', html)
-            if not m:
-                m = re.search(r'window\.location\s*=\s*\(\s*["\'](https://[^"\']+)["\']', html)
-            if m:
-                pdf_url = m.group(1) if m.lastindex else m.group(0)
-                pdf_resp = requests.get(pdf_url, headers=headers, timeout=40)
-                if pdf_resp.status_code != 200 or pdf_resp.content[:4] != b"%PDF":
-                    return {"success": False, "error": "Could not download redirected PDF"}
-                content = pdf_resp.content
-            else:
-                return {"success": False, "error": "Response is not a PDF"}
-
-        if content[:4] != b"%PDF":
-            return {"success": False, "error": "Downloaded file is not a valid PDF"}
-
-        return {"success": True, "pdf_bytes": content, "source_url": url}
-    except Exception as e:
-        return {"success": False, "error": str(e)[:200]}
-
-
-def pdf_to_preview_images(pdf_bytes: bytes, max_pages: int = 2, scale: float = 1.5) -> List[Any]:
-    """Render PDF pages to PIL images for in-app preview."""
-    images = []
-    try:
-        import pypdfium2 as pdfium
-        from PIL import Image
-        doc = pdfium.PdfDocument(pdf_bytes)
-        n = min(len(doc), max_pages)
-        for i in range(n):
-            page = doc[i]
-            bitmap = page.render(scale=scale)
-            pil = bitmap.to_pil()
-            images.append(pil)
-        return images
-    except Exception:
-        pass
-    # Fallback: try pdfplumber + blank placeholder message via None
-    try:
-        import pdfplumber
-        from PIL import Image, ImageDraw, ImageFont
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for i, page in enumerate(pdf.pages[:max_pages]):
-                # pdfplumber can't always rasterize; draw text extract as fallback card
-                txt = (page.extract_text() or "")[:1200]
-                img = Image.new("RGB", (900, 1200), "white")
-                draw = ImageDraw.Draw(img)
-                y = 20
-                for line in txt.splitlines()[:50]:
-                    draw.text((20, y), line[:90], fill="black")
-                    y += 18
-                images.append(img)
-        return images
-    except Exception:
-        return []
-
-
-def upload_bytes_to_drive(filename: str, data: bytes, mime: str = "application/pdf") -> Dict[str, Any]:
-    """Upload raw bytes to configured Google Drive folder."""
-    if not _has_gdrive_folder():
-        return {"success": False, "error": "Drive folder_id not configured in secrets"}
-    try:
-        from googleapiclient.http import MediaIoBaseUpload
-        folder_id = str(st.secrets["drive"]["folder_id"]).strip()
-        if not folder_id:
-            return {"success": False, "error": "drive.folder_id is empty in secrets"}
-        service = _get_drive_service()
-        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=True)
-        meta = {"name": filename, "parents": [folder_id]}
-        f = (
-            service.files()
-            .create(
-                body=meta,
-                media_body=media,
-                fields="id,webViewLink",
-                supportsAllDrives=True,
-            )
-            .execute()
-        )
-        try:
-            service.permissions().create(
-                fileId=f["id"],
-                body={"type": "anyone", "role": "reader"},
-                supportsAllDrives=True,
-            ).execute()
-        except Exception:
-            pass
-        link = f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view"
-        return {"success": True, "drive_link": link, "file_id": f["id"], "filename": filename}
-    except Exception as e:
-        err = str(e)
-        # Common causes
-        if "File not found" in err or "404" in err:
-            err += " — Check folder_id and that the folder is shared with the service account as Editor."
-        if "googleapiclient" in err or "No module" in err:
-            err += " — Add google-api-python-client to requirements.txt and reboot the app."
-        return {"success": False, "error": err[:400]}
-
-
-def backup_certificate_pdf_to_drive(cert: str, cert_link: str = "") -> Dict[str, Any]:
-    """Download lab PDF and store a permanent copy on Google Drive."""
-    try:
-        dl = download_certificate_pdf(cert, cert_link)
-        if not dl.get("success"):
-            return {"success": False, "error": f"Download failed: {dl.get('error', 'unknown')}"}
-        safe = re.sub(r"[^\w\-]", "_", str(cert))
-        filename = f"{safe}_certificate.pdf"
-        up = upload_bytes_to_drive(filename, dl["pdf_bytes"], "application/pdf")
-        if up.get("success"):
-            up["pdf_bytes"] = dl["pdf_bytes"]
-        return up
-    except Exception as e:
-        return {"success": False, "error": f"Backup error: {str(e)[:300]}"}
+def normalize_pdf_text(text: str) -> str:
+    """Upper-case and normalise punctuation so one set of regexes fits all labs."""
+    t = (text or "").upper()
+    t = t.replace("×", "X").replace("–", "-").replace("—", "-")
+    t = re.sub(r"(?<=[A-Z])-(?=[A-Z])", " ", t)      # CUT-CORNERED -> CUT CORNERED
+    return t
 
 
 def detect_lab_from_pdf_text(text_upper: str) -> str:
-    if "INTERNATIONAL GEMOLOGICAL INSTITUTE" in text_upper or re.search(r"\bIGI\b", text_upper):
-        if "LABORATORY GROWN" in text_upper or "LG" in text_upper:
-            return "IGI"
+    """Decide the lab by report-number shape first, then by whichever name appears first."""
+    if re.search(r"\bLG\d{8,12}\b", text_upper):
         return "IGI"
-    if "GEMOLOGICAL INSTITUTE OF AMERICA" in text_upper or re.search(r"\bGIA\b", text_upper):
+    igi = re.search(r"INTERNATIONAL GEMOLOGICAL INSTITUTE|\bIGI\b", text_upper)
+    gia = re.search(r"GEMOLOGICAL INSTITUTE OF AMERICA|\bGIA\b", text_upper)
+    if igi and gia:
+        return "IGI" if igi.start() < gia.start() else "GIA"
+    if igi:
+        return "IGI"
+    if gia:
         return "GIA"
     return "Unknown"
 
@@ -1419,47 +1601,43 @@ def extract_report_number_from_pdf_text(text_upper: str, lab: str = "") -> str:
     m = re.search(r"\b(LG\d{8,12})\b", text_upper)
     if m:
         return m.group(1)
-    m = re.search(r"(?:IGI\s+)?REPORT\s+NUMBER\s*(LG?\d{8,12})", text_upper)
+    m = re.search(rf"(?:IGI\s+)?REPORT\s+NUMBER{_SEP}(LG?\d{{8,12}})", text_upper)
     if m:
         val = m.group(1)
         if not val.startswith("LG") and lab == "IGI":
             return f"LG{val}" if val.isdigit() else val
         return val
-    m = re.search(r"GIA\s+REPORT\s+(?:NUMBER|#)?\s*(\d{8,13})", text_upper)
+    m = re.search(rf"GIA\s+REPORT\s+(?:NUMBER|#)?{_SEP}(\d{{8,13}})", text_upper)
     if m:
         return m.group(1)
-    m = re.search(r"REPORT\s+NUMBER\s*(\d{8,13})", text_upper)
+    m = re.search(rf"REPORT\s+NUMBER{_SEP}(\d{{8,13}})", text_upper)
     if m:
         return m.group(1)
     return ""
 
 
-def apply_grading_fields_from_text(result: Dict[str, Any], text_upper: str) -> Dict[str, Any]:
+def apply_grading_fields_from_text(result: Dict[str, Any], text: str) -> Dict[str, Any]:
     """Fill shape, measurements, carat, color, clarity, cut quality, process from PDF text."""
-    text_upper = text_upper.replace("×", "X").replace("–", "-").replace("—", "-")
+    text_upper = normalize_pdf_text(text)
 
     shape = parse_shape_and_cutting_style(text_upper)
     if shape:
         result["SHAPE AND CUT"] = shape
 
     for pat in [
-        r"MEASUREMENTS?\s*([\d\.\-\sX]+?\s*MM)",
-        r"([\d\.]+\s*[-–]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+\s*MM)",
-        r"([\d\.]+\s*[Xx×]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+\s*MM)",
+        rf"MEASUREMENTS?{_SEP}([\d\.\-\sX]+?\s*MM)",
+        r"([\d\.]+\s*-\s*[\d\.]+\s*X\s*[\d\.]+\s*MM)",
+        r"([\d\.]+\s*X\s*[\d\.]+\s*X\s*[\d\.]+\s*MM)",
     ]:
         m = re.search(pat, text_upper)
         if m:
-            size = m.group(1).strip().replace("X", "×").replace("x", "×")
-            size = re.sub(r"\s+", " ", size)
-            if "MM" not in size.upper():
-                size += " mm"
-            else:
-                size = size.replace("MM", "mm")
+            size = re.sub(r"\s+", " ", m.group(1).strip().replace("X", "×"))
+            size = size.replace("MM", "mm") if "MM" in size else size + " mm"
             result["MEASUREMENTS"] = size
             break
 
     for pat in [
-        r"CARAT\s+WEIGHT\s*[:\.]?\s*(\d+\.\d{1,3})\s*CARATS?",
+        rf"CARAT\s+WEIGHT{_SEP}(\d+\.\d{{1,3}})\s*CARATS?",     # labelled value first
         r"(\d+\.\d{2})\s*CARATS?",
         r"(\d+\.\d{2})\s*CT\b",
     ]:
@@ -1468,31 +1646,22 @@ def apply_grading_fields_from_text(result: Dict[str, Any], text_upper: str) -> D
             result["CARAT WEIGHT"] = f"{m.group(1)} ct"
             break
 
-    for pat in [r"COLOR\s+GRADE\s*[:\.]?\s*([D-Z])\b", r"\bCOLOR\s*[:\.]?\s*([D-Z])\b"]:
-        m = re.search(pat, text_upper)
-        if m:
-            result["COLOR GRADE"] = m.group(1)
-            break
+    color = parse_color_grade(text_upper)
+    if color:
+        result["COLOR GRADE"] = color
 
-    for pat in [
-        r"CLARITY\s+GRADE\s*[:\.]?\s*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
-        r"\bCLARITY\s*[:\.]?\s*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
-    ]:
+    for pat in [rf"\bCLARITY\s+GRADE{_SEP}{_CLARITY}", rf"\bCLARITY{_SEP}{_CLARITY}"]:
         m = re.search(pat, text_upper)
         if m:
             result["CLARITY GRADE"] = re.sub(r"\s+", "", m.group(1)).upper()
             break
 
-    m = re.search(r"CUT\s+GRADE\s*(IDEAL|EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-    if m:
-        result["CUT"] = m.group(1).title()
-    m = re.search(r"\bPOLISH\s*(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-    if m:
-        result["POLISH"] = m.group(1).title()
-    m = re.search(r"\bSYMMETRY\s*(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-    if m:
-        result["SYMMETRY"] = m.group(1).title()
-    m = re.search(r"\bFLUORESCENCE\s*(NONE|FAINT|MEDIUM|STRONG|VERY STRONG)", text_upper)
+    quality = r"(IDEAL|EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)"
+    for field, label in (("CUT", r"CUT\s+GRADE"), ("POLISH", r"POLISH"), ("SYMMETRY", r"SYMMETRY")):
+        m = re.search(rf"\b{label}{_SEP}{quality}", text_upper)
+        if m:
+            result[field] = m.group(1).title()
+    m = re.search(rf"\bFLUORESCENCE{_SEP}(NONE|FAINT|MEDIUM|STRONG|VERY STRONG)", text_upper)
     if m:
         result["FLUORESCENCE"] = m.group(1).title()
 
@@ -1509,22 +1678,38 @@ def apply_grading_fields_from_text(result: Dict[str, Any], text_upper: str) -> D
     return result
 
 
+def finalize_result(
+    result: Dict[str, Any], source: str, success_at: int = 3,
+    partial_at: int = 1, success_label: str = "Success",
+) -> Dict[str, Any]:
+    """Set Status / Notes from how many core fields were extracted."""
+    filled = sum(1 for k in CORE_FIELDS if result.get(k))
+    if filled >= success_at:
+        result["Status"] = success_label
+        result["Notes"] = f"{source} • {filled}/5 core fields"
+    elif filled >= partial_at:
+        result["Status"] = "Partial"
+        result["Notes"] = f"{source} • partial {filled}/5 fields"
+    else:
+        result["Status"] = "Parse Error"
+        result["Notes"] = f"{source} • key fields not found"
+    return result
+
+
 def parse_certificate_pdf_bytes(pdf_bytes: bytes, filename: str = "") -> Dict[str, Any]:
     """Parse an uploaded IGI/GIA certificate PDF into an inventory row."""
     if not pdf_bytes or pdf_bytes[:4] != b"%PDF":
         row = empty_inventory_row("", "Unknown")
-        row["Status"] = "Error"
-        row["Notes"] = "Not a valid PDF file"
+        row.update(Status="Error", Notes="Not a valid PDF file")
         return row
 
     text = extract_text_from_pdf(pdf_bytes)
     if not text or len(text.strip()) < 40:
         row = empty_inventory_row("", "Unknown")
-        row["Status"] = "Parse Error"
-        row["Notes"] = "Could not extract text from PDF"
+        row.update(Status="Parse Error", Notes="Could not extract text from PDF")
         return row
 
-    text_upper = text.upper()
+    text_upper = normalize_pdf_text(text)
     lab = detect_lab_from_pdf_text(text_upper)
     cert = extract_report_number_from_pdf_text(text_upper, lab)
     if not cert and filename:
@@ -1532,243 +1717,142 @@ def parse_certificate_pdf_bytes(pdf_bytes: bytes, filename: str = "") -> Dict[st
         if m:
             cert = m.group(1)
 
-    result = empty_inventory_row(cert or "Unknown", lab if lab != "Unknown" else infer_lab(cert or ""))
-    result["Lab"] = lab if lab != "Unknown" else result.get("Lab") or infer_lab(cert or "")
+    lab = lab if lab != "Unknown" else infer_lab(cert or "")
+    result = empty_inventory_row(cert or "Unknown", lab)
+    result["Lab"] = lab
     if cert:
-        result["Certificate Number"] = cert
-        if result["Lab"] == "IGI" and cert.upper().startswith("LG"):
-            number_only = re.sub(r"^LG", "", cert, flags=re.I)
-            result["CERTIFICATE LINK"] = f"https://pdf.igi.org/FDR{number_only}.pdf"
-        elif result["Lab"] == "GIA" and cert.isdigit():
+        if lab == "IGI" and cert.upper().startswith("LG"):
+            result["CERTIFICATE LINK"] = f"https://pdf.igi.org/FDR{re.sub(r'^LG', '', cert, flags=re.I)}.pdf"
+        elif lab == "GIA" and cert.isdigit():
             result["CERTIFICATE LINK"] = f"https://www.gia.edu/report-check?reportno={cert}"
 
     apply_grading_fields_from_text(result, text_upper)
-
-    filled = sum(
-        1
-        for k in ["SHAPE AND CUT", "MEASUREMENTS", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"]
-        if result.get(k)
-    )
-    if filled >= 3:
-        result["Status"] = "Success"
-        result["Notes"] = f"Uploaded PDF · {filled}/5 core fields"
-    elif filled >= 1:
-        result["Status"] = "Partial"
-        result["Notes"] = f"Uploaded PDF · partial {filled}/5 fields"
-    else:
-        result["Status"] = "Parse Error"
-        result["Notes"] = "Uploaded PDF · key fields not found"
-
+    finalize_result(result, "Uploaded PDF")
+    if not cert:
+        result["Notes"] += " · report number not found (not saved)"
     return result
+
+
+KNOWN_SHAPES = [
+    "CUT CORNERED RECTANGULAR MODIFIED BRILLIANT",
+    "CUT CORNERED SQUARE MODIFIED BRILLIANT",
+    "SQUARE CUSHION MODIFIED BRILLIANT",
+    "RECTANGULAR CUSHION MODIFIED BRILLIANT",
+    "RECTANGULAR MODIFIED BRILLIANT",
+    "SQUARE MODIFIED BRILLIANT",
+    "CUSHION MODIFIED BRILLIANT",
+    "PEAR MODIFIED BRILLIANT",
+    "OVAL MODIFIED BRILLIANT",
+    "HEART MODIFIED BRILLIANT",
+    "MARQUISE MODIFIED BRILLIANT",
+    "SQUARE EMERALD CUT",
+    "ROUND BRILLIANT",
+    "PRINCESS CUT",
+    "CUSHION BRILLIANT",
+    "OVAL BRILLIANT",
+    "PEAR BRILLIANT",
+    "MARQUISE BRILLIANT",
+    "EMERALD CUT",
+    "RADIANT CUT",
+    "HEART BRILLIANT",
+    "ASSCHER CUT",
+    "TRIANGLE BRILLIANT",
+    "TRILLIANT",
+    "BAGUETTE",
+    "TAPERED BAGUETTE",
+]
+_SHAPE_WORDS = {
+    "CUT", "CORNERED", "RECTANGULAR", "SQUARE", "MODIFIED", "BRILLIANT",
+    "ROUND", "PRINCESS", "CUSHION", "OVAL", "PEAR", "MARQUISE", "EMERALD",
+    "RADIANT", "HEART", "ASSCHER", "TRIANGLE", "TRILLIANT", "BAGUETTE",
+    "TAPERED", "STEP", "MIXED",
+}
 
 
 def parse_shape_and_cutting_style(text_upper: str) -> Optional[str]:
     """
-    Extract full shape name from lab PDF text.
-    Handles multi-line values such as:
-      CUT CORNERED
-      RECTANGULAR MODIFIED
-      BRILLIANT
-    and noise like table percentages (66%) on the same line.
+    Extract the full shape name from lab PDF text. Searches the text that follows
+    the "Shape and Cutting Style" label (multi-line safe, ignores % noise); the
+    longest matching known phrase wins. Only when the label is absent does it
+    fall back to scanning the whole document.
     """
     if not text_upper:
         return None
 
-    # Capture up to ~120 chars after the label (across newlines), stop before measurements/grading
     m = re.search(
-        r"SHAPE\s+AND\s+CUTTING\s+STYLE\s*[:\.]?\s*(.{5,120}?)(?:"
+        r"SHAPE\s+AND\s+CUTTING\s+STYLE[\s.:]*(.{5,120}?)(?:"
         r"MEASUREMENTS?|GRADING\s+RESULTS|CARAT\s+WEIGHT|COLOR\s+GRADE|CLARITY\s+GRADE|"
         r"PROPORTIONS|ADDITIONAL\s+GRADING|$)",
-        text_upper,
-        flags=re.DOTALL,
+        text_upper, flags=re.DOTALL,
     )
-    raw = m.group(1) if m else ""
+    if not m:
+        hits = [p for p in KNOWN_SHAPES if p in text_upper]
+        return max(hits, key=len).title() if hits else None
 
-    # Known full phrases (prefer longest match)
-    known = [
-        "CUT CORNERED RECTANGULAR MODIFIED BRILLIANT",
-        "CUT CORNERED SQUARE MODIFIED BRILLIANT",
-        "CUSHION MODIFIED BRILLIANT",
-        "SQUARE EMERALD CUT",
-        "ROUND BRILLIANT",
-        "PRINCESS CUT",
-        "CUSHION BRILLIANT",
-        "OVAL BRILLIANT",
-        "PEAR BRILLIANT",
-        "MARQUISE BRILLIANT",
-        "EMERALD CUT",
-        "RADIANT CUT",
-        "HEART BRILLIANT",
-        "ASSCHER CUT",
-        "TRIANGLE BRILLIANT",
-        "TRILLIANT",
-        "BAGUETTE",
-        "TAPERED BAGUETTE",
-    ]
-    blob = re.sub(r"[\n\r]+", " ", raw)
-    blob = re.sub(r"\s+", " ", blob).strip()
-    # Drop pure numeric noise (table %, depths)
-    blob = re.sub(r"\b\d+\.?\d*\s*%?", " ", blob)
-    blob = re.sub(r"\s+", " ", blob).strip()
+    blob = re.sub(r"\s+", " ", re.sub(r"[\n\r]+", " ", m.group(1))).strip()
+    blob = re.sub(r"\s+", " ", re.sub(r"\b\d+\.?\d*\s*%?", " ", blob)).strip()
 
-    for phrase in known:
-        if phrase in blob or phrase in text_upper:
-            return phrase.title()
+    hits = [p for p in KNOWN_SHAPES if p in blob]
+    if hits:
+        return max(hits, key=len).title()
 
-    # Build from allowed shape words only (ignore PROPORTIONS noise)
-    allowed = {
-        "CUT", "CORNERED", "RECTANGULAR", "SQUARE", "MODIFIED", "BRILLIANT",
-        "ROUND", "PRINCESS", "CUSHION", "OVAL", "PEAR", "MARQUISE", "EMERALD",
-        "RADIANT", "HEART", "ASSCHER", "TRIANGLE", "TRILLIANT", "BAGUETTE",
-        "TAPERED", "STEP", "MIXED",
-    }
-    tokens = []
+    tokens: List[str] = []
     for tok in re.findall(r"[A-Z]+", blob):
-        if tok in allowed:
+        if tok in _SHAPE_WORDS:
             tokens.append(tok)
         elif tokens and tok in ("MM", "CARAT", "CARATS", "GRADING", "RESULTS"):
             break
-        elif tokens and tok not in allowed:
-            # stop once shape phrase ends
-            if len(tokens) >= 2:
-                break
+        elif len(tokens) >= 2:
+            break
     if len(tokens) >= 2:
         shape = " ".join(tokens)
         if 4 < len(shape) < 80:
             return shape.title()
-
-    # Fallback single-line known shapes anywhere in document
-    for phrase in known:
-        if phrase in text_upper:
-            return phrase.title()
     return None
 
 
+# -------------------------------------------------
+# Lab fetchers
+# -------------------------------------------------
 def fetch_igi_report(report_no: str) -> Dict[str, Any]:
-    """
-    Fetch live IGI Laboratory Grown Diamond report from official PDF.
-    Returns full inventory-format row.
-    """
-    number_only = re.sub(r'^LG', '', report_no, flags=re.IGNORECASE)
+    """Fetch a live IGI Laboratory Grown Diamond report from the official PDF."""
+    number_only = re.sub(r"^LG", "", report_no, flags=re.IGNORECASE)
     cert = report_no if report_no.upper().startswith("LG") else f"LG{number_only}"
     pdf_url = f"https://pdf.igi.org/FDR{number_only}.pdf"
 
     result = empty_inventory_row(cert, "IGI")
     result["CERTIFICATE LINK"] = pdf_url
-
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/pdf,*/*"
-        }
-        resp = requests.get(pdf_url, headers=headers, timeout=25)
-
+        resp = safe_get(pdf_url, allowed_host_suffixes=CERT_ALLOWED_HOST_SUFFIXES,
+                        stream=True, timeout=25, headers={"Accept": "application/pdf,*/*"})
         if resp.status_code == 404:
-            result["Status"] = "Not Found"
-            result["Notes"] = "Certificate PDF not available from laboratory at this time"
+            resp.close()
+            result.update(
+                Status="Not Found",
+                Notes="Certificate PDF not available from laboratory at this time",
+            )
             result["CERTIFICATE LINK"] = f"https://www.igi.org/Verify-Your-Report/?r={cert}"
             return result
         if resp.status_code != 200:
-            result["Status"] = f"HTTP {resp.status_code}"
-            result["Notes"] = "Could not download PDF"
+            result.update(Status=f"HTTP {resp.status_code}", Notes="Could not download PDF")
+            resp.close()
             return result
 
-        text = extract_text_from_pdf(resp.content)
+        content = read_capped(resp, MAX_PDF_BYTES)
+        text = extract_text_from_pdf(content) if content[:4] == b"%PDF" else ""
         if not text or len(text.strip()) < 100:
-            result["Status"] = "Parse Error"
-            result["Notes"] = "Could not extract readable text from PDF"
+            result.update(Status="Parse Error", Notes="Could not extract readable text from PDF")
             return result
 
-        text_upper = text.upper()
-        text_upper = text_upper.replace("×", "X").replace("–", "-").replace("—", "-")
-
-        # Shape (may span multiple lines, e.g. CUT CORNERED / RECTANGULAR MODIFIED / BRILLIANT)
-        shape = parse_shape_and_cutting_style(text_upper)
-        if shape:
-            result["SHAPE AND CUT"] = shape
-
-        # Measurements
-        meas_patterns = [
-            r"MEASUREMENTS?\s*([\d\.\-\sX]+?\s*MM)",
-            r"([\d\.]+\s*[-–]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+\s*MM)",
-            r"([\d\.]+\s*[Xx×]\s*[\d\.]+\s*[Xx×]\s*[\d\.]+\s*MM)",
-        ]
-        for pat in meas_patterns:
-            m = re.search(pat, text_upper)
-            if m:
-                size = m.group(1).strip().replace("X", "×").replace("x", "×")
-                size = re.sub(r'\s+', ' ', size)
-                if "MM" not in size.upper():
-                    size += " mm"
-                else:
-                    size = size.replace("MM", "mm")
-                result["MEASUREMENTS"] = size
-                break
-
-        # Carat
-        for pat in [r"(\d+\.\d{2})\s*CARATS?", r"CARAT WEIGHT\s*(\d+\.\d{2})", r"(\d+\.\d{2})\s*CT\b"]:
-            m = re.search(pat, text_upper)
-            if m:
-                result["CARAT WEIGHT"] = f"{m.group(1)} ct"
-                break
-
-        # Color
-        for pat in [r"COLOR GRADE\s*([D-Z])\b", r"COLOR\s*GRADE\s*[:\s]*([D-Z])\b"]:
-            m = re.search(pat, text_upper)
-            if m:
-                result["COLOR GRADE"] = m.group(1)
-                break
-
-        # Clarity
-        for pat in [
-            r"CLARITY GRADE\s*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
-            r"CLARITY\s*GRADE\s*[:\s]*((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))",
-        ]:
-            m = re.search(pat, text_upper)
-            if m:
-                result["CLARITY GRADE"] = re.sub(r'\s+', '', m.group(1)).upper()
-                break
-
-        # Cut / Polish / Symmetry / Fluorescence
-        m = re.search(r"CUT GRADE\s*(IDEAL|EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-        if m:
-            result["CUT"] = m.group(1).title()
-
-        m = re.search(r"POLISH\s*(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-        if m:
-            result["POLISH"] = m.group(1).title()
-
-        m = re.search(r"SYMMETRY\s*(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-        if m:
-            result["SYMMETRY"] = m.group(1).title()
-
-        m = re.search(r"FLUORESCENCE\s*(NONE|FAINT|MEDIUM|STRONG|VERY STRONG)", text_upper)
-        if m:
-            result["FLUORESCENCE"] = m.group(1).title()
-
-        # Process
-        if re.search(r"CHEMICAL\s+VAPOR\s+DEPOSITION|\bCVD\b", text_upper):
-            result["Process"] = "CVD"
-        elif re.search(r"HIGH\s+PRESSURE\s+HIGH\s+TEMPERATURE|\bHPHT\b", text_upper):
-            result["Process"] = "HPHT"
-        else:
+        apply_grading_fields_from_text(result, text)
+        if not result.get("Process"):
             result["Process"] = "Unknown"
-
-        filled = sum(1 for k in ["SHAPE AND CUT", "MEASUREMENTS", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"] if result[k])
-        if filled >= 3:
-            result["Status"] = "Success"
-            result["Notes"] = f"Fetched live • {filled}/5 core fields"
-        elif filled >= 1:
-            result["Status"] = "Partial"
-            result["Notes"] = f"Partial extraction • {filled}/5 fields"
-        else:
-            result["Status"] = "Parse Error"
-            result["Notes"] = "Text extracted but key fields not found"
-
+        finalize_result(result, "Fetched live")
+    except UnsafeURL as e:
+        result.update(Status="Error", Notes=f"Blocked: {e}")
     except Exception as e:
-        result["Status"] = "Error"
-        result["Notes"] = str(e)[:150]
-
+        logger.warning("IGI fetch failed for %s: %s", cert, e)
+        result.update(Status="Error", Notes=str(e)[:150])
     return result
 
 
@@ -1776,144 +1860,70 @@ def fetch_gia_from_token(token_url: str) -> Dict[str, Any]:
     """
     Download a GIA report PDF using a special token link
     (https://pdf.gia.edu/?ReportNumber=HASH) and extract grading data.
-    Returns full inventory-format row.
     """
     result = empty_inventory_row("Unknown", "GIA")
     result["Process"] = "—"
     result["CERTIFICATE LINK"] = token_url
-
+    hdrs = {"Accept": "application/pdf,text/html,*/*"}
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        }
-
-        # Step 1: Get the token page (contains JS redirect to S3)
-        resp = requests.get(token_url, headers=headers, timeout=20, allow_redirects=True)
+        resp = safe_get(token_url, allowed_host_suffixes=CERT_ALLOWED_HOST_SUFFIXES,
+                        stream=True, timeout=20, headers=hdrs)
+        ct = (resp.headers.get("Content-Type") or "").lower()
+        body = read_capped(resp, MAX_PDF_BYTES)
 
         pdf_url = None
-        content_type = resp.headers.get("Content-Type", "").lower()
-
-        if "pdf" in content_type:
-            # Direct PDF
-            pdf_bytes = resp.content
-            # Try to extract report number from URL if possible
-            m = re.search(r"/(\d{8,13})\.pdf", token_url)
-            if m:
-                result["Certificate Number"] = m.group(1)
+        if body[:4] == b"%PDF" or "pdf" in ct:
+            pdf_bytes = body
         else:
-            # Look for the S3 redirect URL inside the HTML/JS
-            html = resp.text
-            m = re.search(r'https://[^"\']+\.pdf[^"\']*', html)
+            html = body.decode("utf-8", errors="ignore")
+            m = re.search(r'https://[^"\']+\.pdf[^"\']*', html) or \
+                re.search(r'window\.location\s*=\s*\(\s*["\'](https://[^"\']+)["\']', html)
             if not m:
-                # Sometimes it is window.location = ("...")
-                m = re.search(r'window\.location\s*=\s*\(\s*["\'](https://[^"\']+)["\']', html)
-            if m:
-                pdf_url = m.group(1) if m.lastindex else m.group(0)
-            else:
                 result["Notes"] = "Could not find PDF URL in token page"
                 return result
-
-            # Extract report number from the S3 path if possible
-            num_match = re.search(r"/(\d{8,13})\.pdf", pdf_url)
-            if num_match:
-                result["Certificate Number"] = num_match.group(1)
-
-            # Step 2: Download the actual PDF
-            pdf_resp = requests.get(pdf_url, headers=headers, timeout=30)
-            if pdf_resp.status_code != 200:
-                result["Notes"] = f"PDF download failed (HTTP {pdf_resp.status_code})"
+            pdf_url = m.group(1) if m.lastindex else m.group(0)
+            r2 = safe_get(pdf_url, allowed_host_suffixes=CERT_ALLOWED_HOST_SUFFIXES,
+                          stream=True, timeout=30, headers=hdrs)
+            if r2.status_code != 200:
+                result["Notes"] = f"PDF download failed (HTTP {r2.status_code})"
+                r2.close()
                 return result
-            pdf_bytes = pdf_resp.content
+            pdf_bytes = read_capped(r2, MAX_PDF_BYTES)
 
-        # Step 3: Extract text from PDF (reuse the same robust extractor)
         text = extract_text_from_pdf(pdf_bytes)
         if not text or len(text.strip()) < 80:
-            result["Status"] = "Parse Error"
-            result["Notes"] = "Downloaded PDF but could not extract text"
+            result.update(Status="Parse Error", Notes="Downloaded PDF but could not extract text")
             return result
 
-        text_upper = text.upper()
-
-        # GIA reports use many dots between label and value, e.g.:
-        # Shape and Cutting Style ............................................ Round Brilliant
-        # Carat Weight ........................................................................ 0.50 carat
-        # Color Grade ........................................................................................ G
-        # Clarity Grade ......................................................................................SI1
-
-        # ---------- Report Number ----------
-        if result.get("Certificate Number") in ("Unknown", "", None):
-            m = re.search(r"GIA REPORT NUMBER[\s.]+(\d{8,13})", text_upper)
+        text_upper = normalize_pdf_text(text)
+        num = re.search(r"/(\d{8,13})\.pdf", pdf_url or token_url)
+        if num:
+            result["Certificate Number"] = num.group(1)
+        else:
+            m = re.search(rf"GIA\s+REPORT\s+NUMBER{_SEP}(\d{{8,13}})", text_upper)
             if m:
                 result["Certificate Number"] = m.group(1)
 
-        # ---------- Shape (multi-line safe) ----------
-        shape = parse_shape_and_cutting_style(text_upper)
-        if shape:
-            result["SHAPE AND CUT"] = shape
-
-        # ---------- Measurements ----------
-        m = re.search(r"MEASUREMENTS[\s.]+([\d\.\s\-X]+)\s*MM", text_upper)
-        if m:
-            size = m.group(1).strip().replace("X", "×")
-            size = re.sub(r'\s+', ' ', size) + " mm"
-            result["MEASUREMENTS"] = size
-
-        # ---------- Carat Weight ----------
-        m = re.search(r"CARAT WEIGHT[\s.]+([\d\.]+)\s*CARAT", text_upper)
-        if m:
-            result["CARAT WEIGHT"] = f"{m.group(1)} ct"
-
-        # ---------- Color ----------
-        m = re.search(r"COLOR GRADE[\s.]+([D-Z])\b", text_upper)
-        if m:
-            result["COLOR GRADE"] = m.group(1)
-
-        # ---------- Clarity ----------
-        m = re.search(r"CLARITY GRADE[\s.]+((?:FL|IF|VVS\s*[12]|VS\s*[12]|SI\s*[12]|I\s*[123]))", text_upper)
-        if m:
-            result["CLARITY GRADE"] = re.sub(r'\s+', '', m.group(1)).upper()
-
-        # Cut / Polish / Symmetry / Fluorescence (GIA)
-        m = re.search(r"CUT GRADE[\s.]+(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-        if m:
-            result["CUT"] = m.group(1).title()
-        m = re.search(r"POLISH[\s.]+(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-        if m:
-            result["POLISH"] = m.group(1).title()
-        m = re.search(r"SYMMETRY[\s.]+(EXCELLENT|VERY GOOD|GOOD|FAIR|POOR)", text_upper)
-        if m:
-            result["SYMMETRY"] = m.group(1).title()
-        m = re.search(r"FLUORESCENCE[\s.]+(NONE|FAINT|MEDIUM|STRONG|VERY STRONG)", text_upper)
-        if m:
-            result["FLUORESCENCE"] = m.group(1).title()
-
-        result["Process"] = "—"
-        result["DESCRIPTION"] = "NATURAL DIAMOND"
-
-        filled = sum(1 for k in ["SHAPE AND CUT", "MEASUREMENTS", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE"] if result[k])
-        if filled >= 4:
-            result["Status"] = "Success (Token PDF)"
-            result["Notes"] = f"Extracted from GIA PDF • {filled}/5 fields"
-        elif filled >= 2:
-            result["Status"] = "Partial"
-            result["Notes"] = f"PDF downloaded • {filled}/5 fields found"
-        else:
-            result["Status"] = "Parse Error"
-            result["Notes"] = "PDF downloaded but key fields not found"
-
-
+        apply_grading_fields_from_text(result, text_upper)
+        if not result.get("Process"):
+            result["Process"] = "—"
+        finalize_result(result, "Extracted from GIA PDF", success_at=4, partial_at=2,
+                        success_label="Success (Token PDF)")
+        if not _valid_cert(result["Certificate Number"]):
+            result["Notes"] += " · report number not found (not saved)"
+    except UnsafeURL as e:
+        result.update(Status="Error", Notes=f"Blocked: {e}")
     except Exception as e:
-        result["Status"] = "Error"
-        result["Notes"] = str(e)[:120]
-
+        logger.warning("GIA token fetch failed: %s", e)
+        result.update(Status="Error", Notes=str(e)[:120])
     return result
 
 
-def fetch_gia_info(report_no: str, try_playwright: bool = False) -> Dict[str, Any]:
+def fetch_gia_info(report_no: str) -> Dict[str, Any]:
     """
-    GIA lookup.
-    By default only returns a clean link.
-    If try_playwright=True, attempts browser extraction (often fails due to GIA protection).
+    GIA lookup by number. GIA blocks scripted access to report data, so this
+    returns a clean report-check link only; use a token link or PDF upload to
+    capture grading fields.
     """
     result = empty_inventory_row(report_no, "GIA")
     result["Process"] = "—"
@@ -1921,129 +1931,207 @@ def fetch_gia_info(report_no: str, try_playwright: bool = False) -> Dict[str, An
     result["CERTIFICATE LINK"] = f"https://www.gia.edu/report-check?reportno={report_no}"
     result["Status"] = "Link Ready"
     result["Notes"] = "Open laboratory report check link"
-
-    if not try_playwright or not HAS_PLAYWRIGHT:
-        if try_playwright and not HAS_PLAYWRIGHT:
-            result["Notes"] = "Open laboratory report check link"
-        return result
-
-    url = f"https://www.gia.edu/report-check?reportno={report_no}"
-
-    try:
-        with sync_playwright() as p:
-            # Hardened launch args to avoid HTTP/2 and anti-bot issues
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-http2",
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-web-security",
-                    "--ignore-certificate-errors",
-                ]
-            )
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                java_script_enabled=True,
-            )
-            # Hide webdriver flag
-            page = context.new_page()
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            """)
-
-            # Use domcontentloaded instead of networkidle (more reliable)
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(3500)  # allow JS to render
-
-            content = page.inner_text("body")
-            browser.close()
-
-        if not content or len(content) < 100:
-            raise Exception("Empty page content")
-
-        text = content.upper()
-
-        # ---------- Shape ----------
-        shape_match = re.search(
-            r"(ROUND|PRINCESS|CUSHION|OVAL|PEAR|MARQUISE|EMERALD|RADIANT|HEART|ASSCHER)"
-            r"(?:\s+(?:BRILLIANT|CUT|MODIFIED|MODIFIED BRILLIANT))?",
-            text
-        )
-        if shape_match:
-            result["Shape"] = shape_match.group(0).title().strip()
-
-        # ---------- Measurements ----------
-        meas = re.search(r"([\d\.]+\s*[xX×]\s*[\d\.]+\s*[xX×]\s*[\d\.]+\s*mm)", text, re.IGNORECASE)
-        if not meas:
-            meas = re.search(r"([\d\.]+\s*-\s*[\d\.]+\s*[xX×]\s*[\d\.]+\s*mm)", text, re.IGNORECASE)
-        if meas:
-            result["MM Size"] = meas.group(1).replace("X", "×").replace("x", "×")
-
-        # ---------- Carat ----------
-        carat = re.search(r"([\d\.]+)\s*CARAT", text)
-        if carat:
-            result["Weight"] = f"{carat.group(1)} ct"
-
-        # ---------- Color ----------
-        color = re.search(r"COLOR\s*(?:GRADE)?\s*[:\s]*([D-Z])\b", text)
-        if color:
-            result["Color"] = color.group(1)
-
-        # ---------- Clarity ----------
-        clarity = re.search(r"CLARITY\s*(?:GRADE)?\s*[:\s]*((?:FL|IF|VVS[12]|VS[12]|SI[12]|I[123]))", text)
-        if clarity:
-            result["Clarity"] = clarity.group(1)
-
-        filled = sum(1 for k in ["Shape", "MM Size", "Weight", "Color", "Clarity"] if result[k])
-        if filled >= 2:
-            result["Status"] = "Success (Playwright)"
-            result["Notes"] = f"Extracted via browser • {filled}/5 fields"
-        else:
-            result["Status"] = "Partial / Link"
-            result["Notes"] = "Limited data extracted – see links below"
-
-    except Exception as e:
-        err_msg = str(e)
-        # Shorten common long errors
-        if "ERR_HTTP2" in err_msg or "PROTOCOL_ERROR" in err_msg:
-            short = "HTTP/2 protocol error (common with GIA)"
-        elif "Timeout" in err_msg:
-            short = "Page load timeout"
-        else:
-            short = err_msg[:70]
-        result["Status"] = "Link Ready"
-        result["Notes"] = f"Browser failed ({short}) – use links below"
-
     return result
+
+
+def parse_color_grade(text_upper: str) -> Optional[str]:
+    """
+    D–Z colorless scale OR fancy color descriptions, e.g.:
+      FANCY INTENSE YELLOW, FANCY VIVID PINK, FANCY LIGHT BLUE
+    """
+    if not text_upper:
+        return None
+
+    # Fancy / colored grades (check before single-letter D–Z)
+    fancy = re.search(
+        r"COLOR\s+GRADE[\s.:]*"
+        r"((?:FANCY\s+)?"
+        r"(?:VIVID|INTENSE|DEEP|DARK|LIGHT|VERY\s+LIGHT|FAINT)?\s*"
+        r"(?:YELLOW|ORANGE|PINK|BLUE|GREEN|PURPLE|VIOLET|BROWN|GRAY|GREY|"
+        r"CHAMPAGNE|COGNAC|BLACK|WHITE|RED|GRAYISH|GREYISH|BROWNISH|GREENISH|"
+        r"YELLOWISH|ORANGEY|PINKISH|BLUISH)?"
+        r"(?:\s+(?:YELLOW|ORANGE|PINK|BLUE|GREEN|PURPLE|VIOLET|BROWN|GRAY|GREY|"
+        r"CHAMPAGNE|COGNAC|BLACK|WHITE|RED))*"
+        r")",
+        text_upper,
+    )
+    if fancy:
+        val = re.sub(r"\s+", " ", fancy.group(1)).strip()
+        # Reject empty / noise
+        if val and not re.fullmatch(r"[D-Z]", val):
+            # Must contain FANCY or a color word
+            if "FANCY" in val or re.search(
+                r"YELLOW|ORANGE|PINK|BLUE|GREEN|PURPLE|BROWN|GRAY|GREY|BLACK|WHITE|RED|CHAMPAGNE|COGNAC",
+                val,
+            ):
+                return val.title()
+
+    # Explicit "FANCY …" anywhere near color section
+    m2 = re.search(
+        r"\b(FANCY\s+(?:VIVID|INTENSE|DEEP|DARK|LIGHT|VERY\s+LIGHT|FAINT)?\s*"
+        r"(?:YELLOW|ORANGE|PINK|BLUE|GREEN|PURPLE|VIOLET|BROWN|GRAY|GREY|"
+        r"CHAMPAGNE|COGNAC|BLACK|WHITE|RED|"
+        r"(?:GRAYISH|GREYISH|BROWNISH|GREENISH|YELLOWISH|ORANGEY|PINKISH|BLUISH)\s+\w+)"
+        r")\b",
+        text_upper,
+    )
+    if m2:
+        return re.sub(r"\s+", " ", m2.group(1)).strip().title()
+
+    # Standard D–Z
+    m = re.search(r"COLOR\s+GRADE[\s.:]*([D-Z])\b", text_upper)
+    if m:
+        return m.group(1)
+    return None
+
+
+# -------------------------------------------------
+# Inventory search (moved to module level so it can be tested)
+# -------------------------------------------------
+def smart_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Filter with partial keywords, cert fragments, shape/color/clarity/carat."""
+    if df.empty or not query or not query.strip():
+        return df
+
+    q = query.strip().upper()
+    mask = pd.Series([True] * len(df), index=df.index)
+    search_cols = [
+        c for c in [
+            "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE",
+            "CLARITY GRADE", "Process", "FGI Item Number", "Current Location/Status",
+            "For stock or Customer", "Comment", "DESCRIPTION", "Lab",
+            "Production Order #, if for stock",
+        ] if c in df.columns
+    ]
+
+    # --- Structured filters (AND) ---
+    carat_m = re.search(r"(\d+\.?\d*)\s*(?:CT|CARAT|CTS|CARATS)\b", q)
+    if carat_m and "CARAT WEIGHT" in df.columns:
+        target = float(carat_m.group(1))
+        is_whole = abs(target - round(target)) < 1e-9
+
+        def _near_carat(val):
+            try:
+                num = float(re.search(r"[\d.]+", str(val).upper()).group())
+                if is_whole:
+                    return target <= num < target + 1.0
+                return abs(num - target) <= CARAT_TOLERANCE
+            except Exception:
+                return False
+
+        mask &= df["CARAT WEIGHT"].apply(_near_carat)
+
+    shapes = [
+        "ROUND", "OVAL", "PEAR", "MARQUISE", "PRINCESS", "CUSHION",
+        "EMERALD", "RADIANT", "HEART", "ASSCHER", "RECTANGULAR", "SQUARE",
+        "BRILLIANT", "CUT CORNERED",
+    ]
+    for shape in shapes:
+        if re.search(rf"\b{shape}\b", q) and "SHAPE AND CUT" in df.columns:
+            mask &= df["SHAPE AND CUT"].astype(str).str.upper().str.contains(shape, na=False)
+
+    color_m2 = re.search(r"(?:COLOR|COLOUR)\s*([D-Z])\b|\b([D-Z])\s*(?:COLOR|COLOUR)\b", q)
+    if color_m2 and "COLOR GRADE" in df.columns:
+        letter = color_m2.group(1) or color_m2.group(2)
+        mask &= df["COLOR GRADE"].astype(str).str.upper() == letter
+
+    clar_m = re.search(
+        r"\b(FL|IF|VVS\s*1|VVS\s*2|VVS1|VVS2|VS\s*1|VS\s*2|VS1|VS2|"
+        r"SI\s*1|SI\s*2|SI1|SI2|I\s*1|I\s*2|I\s*3|I1|I2|I3)\b",
+        q,
+    )
+    if clar_m and "CLARITY GRADE" in df.columns:
+        clar = re.sub(r"\s+", "", clar_m.group(1)).upper()
+        mask &= df["CLARITY GRADE"].astype(str).str.upper().str.replace(" ", "", regex=False) == clar
+
+    if re.search(r"\bCVD\b", q) and "Process" in df.columns:
+        mask &= df["Process"].astype(str).str.upper().str.contains("CVD", na=False)
+    if re.search(r"\bHPHT\b", q) and "Process" in df.columns:
+        mask &= df["Process"].astype(str).str.upper().str.contains("HPHT", na=False)
+
+    # --- Partial keyword / cert fragment tokens (AND across tokens) ---
+    tokens = re.findall(r"[A-Z0-9]{2,}", q)
+    skip = {
+        "CT", "CARAT", "CARATS", "CTS", "SHOW", "ME", "IN", "THE", "WITH", "AND",
+        "COLOR", "COLOUR", "CLARITY", "SHAPE", "CUT", "GRADE", "CVD", "HPHT",
+    }
+    skip |= set(shapes)
+    for tok in tokens:
+        if tok in skip:
+            continue
+        if re.match(r"^\d+\.?\d*(CT|CARAT|CTS|CARATS)$", tok):
+            continue
+        if re.match(r"^(FL|IF|VVS[12]?|VS[12]?|SI[12]?|I[123]?)$", tok):
+            continue
+        # Digit-only or short cert-like → prefer certificate number partial match
+        if re.match(r"^\d{3,}$", tok) or (tok.startswith("LG") and len(tok) >= 4):
+            if "Certificate Number" in df.columns:
+                mask &= df["Certificate Number"].astype(str).str.upper().str.contains(
+                    re.escape(tok), na=False
+                )
+            continue
+        # General partial: token must appear in any searchable column
+        if search_cols:
+            sub = pd.Series([False] * len(df), index=df.index)
+            for c in search_cols:
+                sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
+            mask &= sub
+
+    # If query is a single short fragment with no structured hit, still partial-search all
+    if len(tokens) == 1 and tokens[0] not in skip and search_cols:
+        tok = tokens[0]
+        if not (
+            carat_m or color_m2 or clar_m
+            or any(re.search(rf"\b{s}\b", q) for s in shapes)
+        ):
+            sub = pd.Series([False] * len(df), index=df.index)
+            for c in search_cols:
+                sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
+            mask = sub
+
+    return df[mask]
+
+
+# -------------------------------------------------
+# Batch lookup (runs in worker threads – no Streamlit calls in here)
+# -------------------------------------------------
+def fetch_item(item_type: str, value: str) -> Dict[str, Any]:
+    if item_type == "token":
+        return fetch_gia_from_token(value)
+    if is_igi(value):
+        return fetch_igi_report(value)
+    if is_gia(value):
+        return fetch_gia_info(value)
+    data = empty_inventory_row(value, "Unknown")
+    data["Status"] = "Unknown Format"
+    data["Notes"] = "Could not determine if IGI or GIA"
+    return data
+
+
+def _clean_url(v: Any) -> str:
+    s = _s(v)
+    return s if s.lower().startswith(("http://", "https://")) else ""
+
+
+def _clear_cert_input() -> None:
+    st.session_state["cert_input"] = ""
+    st.session_state.pop("batch_results", None)
+    st.session_state["batch_preview_cert"] = None
 
 
 # -------------------------------------------------
 # Streamlit UI
 # -------------------------------------------------
-
 st.markdown("## Certified Stone Inventory")
 st.caption("FGI · Certificate lookup and inventory")
-_warn = st.session_state.pop("sheets_save_warning", None)
-if _warn:
-    st.warning(_warn)
 
-# Sidebar
 with st.sidebar:
     st.markdown("**Overview**")
     _stats_df = load_all_inventory()
     st.metric("Total certificates", len(_stats_df))
-    _today = date.today().isoformat()
-    _added_today = 0
-    if not _stats_df.empty and "date_added" in _stats_df.columns:
-        _added_today = int(_stats_df["date_added"].astype(str).str.startswith(_today).sum())
-    st.metric("Added today", _added_today)
-    use_playwright = False
+    st.metric("Added today", count_added_today(_stats_df))
+    st.caption("Storage: Google Sheets" if use_gsheets() else "Storage: local SQLite (not shared)")
 
-# ---------- Tabs ----------
 tab_add, tab_all, tab_edit, tab_video = st.tabs([
     "Add certificates",
     "Inventory",
@@ -2058,130 +2146,113 @@ with tab_add:
     st.markdown("##### Fetch by certificate number")
     report_text = st.text_area(
         "Certificate numbers",
-        value="",
         height=140,
         placeholder="Enter one certificate number per line (IGI or GIA)",
+        key="cert_input",
     )
     col1, col2 = st.columns([1, 1])
     with col1:
-        fetch_btn = st.button("Fetch & save", type="primary", use_container_width=True)
+        fetch_btn = st.button("Fetch & save", type="primary", **_STRETCH)
     with col2:
-        clear_btn = st.button("Clear", use_container_width=True)
-
-    if clear_btn:
-        st.rerun()
+        st.button("Clear", on_click=_clear_cert_input, **_STRETCH)
 
     st.divider()
     st.markdown("##### Upload certificate PDF")
     st.caption("Use when live fetch is blocked (e.g. some IGI/GIA reports). Upload the PDF from your browser download.")
     uploaded_files = st.file_uploader(
-        "Certificate PDF files",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="cert_pdf_uploader",
+        "Certificate PDF files", type=["pdf"], accept_multiple_files=True, key="cert_pdf_uploader",
     )
-    upload_btn = st.button("Parse & save PDFs", type="primary", use_container_width=True, key="parse_pdfs_btn")
+    upload_btn = st.button("Parse & save PDFs", type="primary", key="parse_pdfs_btn", **_STRETCH)
 
     if upload_btn and uploaded_files:
         results_upload = []
         progress = st.progress(0)
         for i, uf in enumerate(uploaded_files):
-            raw = uf.read()
-            row = parse_certificate_pdf_bytes(raw, filename=uf.name)
-            results_upload.append(row)
-            progress.progress((i + 1) / max(len(uploaded_files), 1))
-        if results_upload:
-            upsert_rows(results_upload)
-            st.success(f"{len(results_upload)} PDF(s) parsed and saved.")
-            show_cols = [
-                c for c in [
-                    "Certificate Number", "Lab", "SHAPE AND CUT", "CARAT WEIGHT",
-                    "COLOR GRADE", "CLARITY GRADE", "MEASUREMENTS", "Process", "Status", "Notes",
-                ] if c in results_upload[0]
-            ]
-            st.dataframe(pd.DataFrame(results_upload)[show_cols], use_container_width=True, hide_index=True)
+            results_upload.append(parse_certificate_pdf_bytes(uf.read(), filename=uf.name))
+            progress.progress((i + 1) / len(uploaded_files))
+        progress.empty()
+        try:
+            report_upsert(upsert_rows(results_upload))
+        except RuntimeError as e:
+            st.error(str(e))
+        st.session_state["upload_results"] = pd.DataFrame(results_upload)
     elif upload_btn and not uploaded_files:
         st.warning("Please choose one or more PDF files first.")
 
+    _up = st.session_state.get("upload_results")
+    if _up is not None and not _up.empty:
+        show_cols = [c for c in [
+            "Certificate Number", "Lab", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE",
+            "CLARITY GRADE", "MEASUREMENTS", "Process", "Status", "Notes",
+        ] if c in _up.columns]
+        st.dataframe(_up[show_cols], hide_index=True, **_STRETCH)
+
     if fetch_btn and report_text.strip():
         raw_lines = [line.strip() for line in report_text.strip().splitlines() if line.strip()]
-        seen = set()
-        items_to_process = []
+        seen, items = set(), []
         for line in raw_lines:
             if is_gia_token_url(line):
-                key = line
-                if key not in seen:
-                    seen.add(key)
-                    items_to_process.append(("token", line))
+                if line not in seen:
+                    seen.add(line)
+                    items.append(("token", line))
             else:
                 cleaned = clean_report_number(line)
                 if cleaned and cleaned not in seen:
                     seen.add(cleaned)
-                    items_to_process.append(("number", cleaned))
+                    items.append(("number", cleaned))
 
         progress = st.progress(0)
         status_text = st.empty()
-        results = []
-
-        for i, (item_type, value) in enumerate(items_to_process):
-            display = value if len(value) < 60 else value[:50] + "..."
-            status_text.text(f"Retrieving {display} ({i+1}/{len(items_to_process)})")
-            progress.progress((i + 1) / len(items_to_process))
-
-            if item_type == "token":
-                data = fetch_gia_from_token(value)
-            elif is_igi(value):
-                data = fetch_igi_report(value)
-            elif is_gia(value):
-                data = fetch_gia_info(value, try_playwright=use_playwright)
-            else:
-                data = empty_inventory_row(value, "Unknown")
-                data["Status"] = "Unknown Format"
-                data["Notes"] = "Could not determine if IGI or GIA"
-            results.append(data)
-            time.sleep(0.4)
-
+        results: List[Optional[Dict[str, Any]]] = [None] * len(items)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fetch_item, t, v): i for i, (t, v) in enumerate(items)}
+            for n_done, fut in enumerate(as_completed(futures), start=1):
+                i = futures[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:           # never let one lookup kill the batch
+                    logger.exception("Lookup failed")
+                    row = empty_inventory_row(items[i][1], "Unknown")
+                    row.update(Status="Error", Notes=str(e)[:150])
+                    results[i] = row
+                status_text.text(f"Retrieved {n_done}/{len(items)}")
+                progress.progress(n_done / len(items))
         progress.empty()
         status_text.empty()
 
-        # Save rows to DB (including Not Found so user can fill grades later)
+        # Save everything that has a usable certificate number (including "Not Found",
+        # so grades can be filled later). Merge rules protect existing data.
         to_save = [r for r in results if r.get("Status") not in ("Unknown Format", "Error")]
-        if to_save:
-            upsert_rows(to_save)
-            st.success(f"{len(to_save)} record(s) saved to inventory.")
+        try:
+            report_upsert(upsert_rows(to_save))
+        except RuntimeError as e:
+            st.error(str(e))
 
         df_new = pd.DataFrame(results)
-        inv_cols = [c for c in INVENTORY_COLUMNS if c in df_new.columns]
-        df_new = df_new[inv_cols]
+        df_new["Saved"] = [
+            r.get("Status") not in ("Unknown Format", "Error") and _valid_cert(r.get("Certificate Number"))
+            for r in results
+        ]
+        st.session_state["batch_results"] = df_new[[c for c in INVENTORY_COLUMNS + ["Saved"] if c in df_new.columns]]
+        st.session_state["batch_preview_cert"] = None
 
+    _batch = st.session_state.get("batch_results")
+    if _batch is not None and not _batch.empty:
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Processed", len(df_new))
-        m2.metric("IGI", len(df_new[df_new["Lab"] == "IGI"]) if "Lab" in df_new.columns else 0)
-        m3.metric("GIA", len(df_new[df_new["Lab"] == "GIA"]) if "Lab" in df_new.columns else 0)
+        m1.metric("Processed", len(_batch))
+        m2.metric("IGI", int((_batch["Lab"] == "IGI").sum()))
+        m3.metric("GIA", int((_batch["Lab"] == "GIA").sum()))
         m4.metric("Added today", count_added_today())
-        try:
-            ev_new = st.dataframe(
-                df_new, use_container_width=True, hide_index=True,
-                on_select="rerun", selection_mode="single-row", key="batch_table_select",
-            )
-            sel_n = ev_new.selection.rows if ev_new and ev_new.selection else []
-            if sel_n and sel_n[0] < len(df_new):
-                crow = df_new.iloc[sel_n[0]]
-                open_certificate_preview(
-                    str(crow.get("Certificate Number", "")),
-                    str(crow.get("CERTIFICATE LINK", "") or ""),
-                )
-        except TypeError:
-            st.dataframe(df_new, use_container_width=True, hide_index=True)
+        ev_new = st.dataframe(
+            _batch, hide_index=True, on_select="rerun", selection_mode="single-row",
+            key="batch_table_select", **_STRETCH,
+        )
+        maybe_open_preview("batch_preview_cert", ev_new.selection.rows if ev_new else [], _batch)
 
-        # Download this batch
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            export = df_new.drop(columns=[c for c in ["Lab", "Status", "Notes", "date_added", "last_updated"] if c in df_new.columns], errors="ignore")
-            export.to_excel(writer, index=False, sheet_name="Batch")
+        export = _batch.drop(columns=["Lab", "Status", "Notes", "date_added", "last_updated", "Saved"], errors="ignore")
         st.download_button(
             "Export Excel",
-            data=buffer.getvalue(),
+            data=df_to_xlsx_bytes(export, "Batch"),
             file_name=f"Batch_{date.today().isoformat()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
@@ -2192,297 +2263,124 @@ with tab_add:
 with tab_all:
     df_all = load_all_inventory()
 
-    # Compact toolbar: search + filters on one row
     t1, t2, t3 = st.columns([3, 1, 1])
     with t1:
         search_q = st.text_input(
-            "Search",
-            value="",
+            "Search", value="",
             placeholder="Search by certificate, shape, color, clarity, carat…",
-            label_visibility="collapsed",
-            key="inventory_search",
+            label_visibility="collapsed", key="inventory_search",
         )
     with t2:
         filter_lab = st.selectbox("Lab", ["All", "IGI", "GIA", "Unknown"], key="lab_filter", label_visibility="collapsed")
     with t3:
         filter_today = st.checkbox("Today only", value=False, key="today_filter")
 
-    def smart_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
-        """Filter with partial keywords, cert fragments, shape/color/clarity/carat."""
-        if df.empty or not query or not query.strip():
-            return df
-
-        q = query.strip().upper()
-        mask = pd.Series([True] * len(df), index=df.index)
-        search_cols = [
-            c for c in [
-                "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE",
-                "CLARITY GRADE", "Process", "FGI Item Number", "Current Location/Status",
-                "For stock or Customer", "Comment", "DESCRIPTION", "Lab",
-                "Production Order #, if for stock",
-            ] if c in df.columns
-        ]
-
-        # --- Structured filters (AND) ---
-        carat_m = re.search(r"(\d+\.?\d*)\s*(?:CT|CARAT|CTS|CARATS)\b", q)
-        if carat_m and "CARAT WEIGHT" in df.columns:
-            target = float(carat_m.group(1))
-            is_whole = abs(target - round(target)) < 1e-9
-
-            def _near_carat(val):
-                try:
-                    num = float(re.search(r"[\d.]+", str(val).upper()).group())
-                    if is_whole:
-                        return target <= num < target + 1.0
-                    return abs(num - target) <= 0.12
-                except Exception:
-                    return False
-
-            mask &= df["CARAT WEIGHT"].apply(_near_carat)
-
-        shapes = [
-            "ROUND", "OVAL", "PEAR", "MARQUISE", "PRINCESS", "CUSHION",
-            "EMERALD", "RADIANT", "HEART", "ASSCHER", "RECTANGULAR", "SQUARE",
-            "BRILLIANT", "CUT CORNERED",
-        ]
-        for shape in shapes:
-            if re.search(rf"\b{shape}\b", q) and "SHAPE AND CUT" in df.columns:
-                mask &= df["SHAPE AND CUT"].astype(str).str.upper().str.contains(shape, na=False)
-
-        color_m2 = re.search(r"(?:COLOR|COLOUR)\s*([D-Z])\b|\b([D-Z])\s*(?:COLOR|COLOUR)\b", q)
-        if color_m2 and "COLOR GRADE" in df.columns:
-            letter = color_m2.group(1) or color_m2.group(2)
-            mask &= df["COLOR GRADE"].astype(str).str.upper() == letter
-
-        clar_m = re.search(
-            r"\b(FL|IF|VVS\s*1|VVS\s*2|VVS1|VVS2|VS\s*1|VS\s*2|VS1|VS2|"
-            r"SI\s*1|SI\s*2|SI1|SI2|I\s*1|I\s*2|I\s*3|I1|I2|I3)\b",
-            q,
-        )
-        if clar_m and "CLARITY GRADE" in df.columns:
-            clar = re.sub(r"\s+", "", clar_m.group(1)).upper()
-            mask &= df["CLARITY GRADE"].astype(str).str.upper().str.replace(" ", "", regex=False) == clar
-
-        if re.search(r"\bCVD\b", q) and "Process" in df.columns:
-            mask &= df["Process"].astype(str).str.upper().str.contains("CVD", na=False)
-        if re.search(r"\bHPHT\b", q) and "Process" in df.columns:
-            mask &= df["Process"].astype(str).str.upper().str.contains("HPHT", na=False)
-
-        # --- Partial keyword / cert fragment tokens (AND across tokens) ---
-        tokens = re.findall(r"[A-Z0-9]{2,}", q)
-        skip = {
-            "CT", "CARAT", "CARATS", "CTS", "SHOW", "ME", "IN", "THE", "WITH", "AND",
-            "COLOR", "COLOUR", "CLARITY", "SHAPE", "CUT", "GRADE", "CVD", "HPHT",
-        }
-        skip |= set(shapes)
-        for tok in tokens:
-            if tok in skip:
-                continue
-            if re.match(r"^\d+\.?\d*(CT|CARAT|CTS|CARATS)$", tok):
-                continue
-            if re.match(r"^(FL|IF|VVS[12]?|VS[12]?|SI[12]?|I[123]?)$", tok):
-                continue
-            # Digit-only or short cert-like → prefer certificate number partial match
-            if re.match(r"^\d{3,}$", tok) or (tok.startswith("LG") and len(tok) >= 4):
-                if "Certificate Number" in df.columns:
-                    mask &= df["Certificate Number"].astype(str).str.upper().str.contains(
-                        re.escape(tok), na=False
-                    )
-                continue
-            # General partial: token must appear in any searchable column
-            if search_cols:
-                sub = pd.Series([False] * len(df), index=df.index)
-                for c in search_cols:
-                    sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
-                mask &= sub
-
-        # If query is a single short fragment with no structured hit, still partial-search all
-        if len(tokens) == 1 and tokens[0] not in skip and search_cols:
-            tok = tokens[0]
-            if not (
-                carat_m or color_m2 or clar_m
-                or any(re.search(rf"\b{s}\b", q) for s in shapes)
-            ):
-                sub = pd.Series([False] * len(df), index=df.index)
-                for c in search_cols:
-                    sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
-                mask = sub
-
-        return df[mask]
-
     view = df_all.copy()
-    if filter_lab != "All" and not view.empty and "Lab" in view.columns:
+    if filter_lab != "All" and not view.empty:
         view = view[view["Lab"] == filter_lab]
-    if filter_today and not view.empty and "date_added" in view.columns:
-        today_str = date.today().isoformat()
-        view = view[view["date_added"].astype(str).str.startswith(today_str)]
+    if filter_today and not view.empty:
+        view = view[view["date_added"].astype(str).str.startswith(date.today().isoformat())]
     if search_q.strip() and not view.empty:
         view = smart_filter(view, search_q)
 
-    # Full column set — show actual URL text (not LinkColumn "Open")
     list_cols = [c for c in INVENTORY_COLUMNS if c in view.columns]
     display_df = view[list_cols].copy() if list_cols else view.copy()
-
     col_config = {}
     for url_col in ("CERTIFICATE LINK", "Video URL", "Video Backup Drive Link", "Certificate PDF Backup Drive Link"):
         if url_col in display_df.columns:
-            def _clean_url(v):
-                s = str(v or "").strip()
-                if s.lower().startswith(("http://", "https://")):
-                    return s
-                return ""
             display_df[url_col] = display_df[url_col].map(_clean_url)
-            try:
-                col_config[url_col] = st.column_config.TextColumn(url_col, width="medium")
-            except Exception:
-                pass
+            col_config[url_col] = st.column_config.TextColumn(url_col, width="medium")
 
     render_inventory_subtotals(view, title=f"{len(view)}/{len(df_all)} shown")
     if view.empty:
         st.info("No matching records.")
     else:
-        try:
-            event = st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                height=600,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="inventory_table_select",
-                column_config=col_config or None,
-            )
-            sel_rows = event.selection.rows if event and event.selection else []
-            if sel_rows and sel_rows[0] < len(view):
-                crow = view.iloc[sel_rows[0]]
-                open_certificate_preview(
-                    str(crow.get("Certificate Number", "")),
-                    str(crow.get("CERTIFICATE LINK", "") or ""),
-                )
-        except TypeError:
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                height=600,
-                column_config=col_config or None,
-            )
-            pick = st.selectbox(
-                "Certificate",
-                view["Certificate Number"].astype(str).tolist(),
-                key="inv_preview_pick",
-            )
-            if st.button("Open details", key="inv_preview_btn"):
-                link = ""
-                m = view[view["Certificate Number"].astype(str) == pick]
-                if not m.empty:
-                    link = str(m.iloc[0].get("CERTIFICATE LINK") or "")
-                open_certificate_preview(pick, link)
-
-        # Fallback if dialog API is unavailable
-        if not HAS_DIALOG and st.session_state.get("inline_preview_cert"):
-            with st.expander(
-                f"Certificate {st.session_state['inline_preview_cert']}",
-                expanded=True,
-            ):
-                render_certificate_preview(
-                    st.session_state["inline_preview_cert"],
-                    st.session_state.get("inline_preview_link", ""),
-                )
-
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            export = view.drop(
-                columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns],
-                errors="ignore",
-            )
-            export.to_excel(writer, index=False, sheet_name="Inventory")
+        event = st.dataframe(
+            display_df, hide_index=True, height=600,
+            on_select="rerun", selection_mode="single-row",
+            key="inventory_table_select", column_config=col_config or None, **_STRETCH,
+        )
+        maybe_open_preview("inv_preview_cert", event.selection.rows if event else [], view)
 
         e1, e2 = st.columns(2)
         with e1:
+            export = view.drop(columns=[c for c in ["Lab", "Status", "Notes"] if c in view.columns], errors="ignore")
             st.download_button(
                 "Export Excel",
-                data=buffer.getvalue(),
+                data=df_to_xlsx_bytes(export, "Inventory"),
                 file_name="Filtered_Inventory.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                **_STRETCH,
             )
         with e2:
             n_view = len(view)
             max_zip = 80
+            zip_key = "|".join(view["Certificate Number"].astype(str).head(max_zip))
             st.caption(f"Certificate PDFs for current filter ({min(n_view, max_zip)} max per run)")
-            if st.button(
-                "Prepare certificate ZIP",
-                use_container_width=True,
-                key="prep_cert_zip",
-                disabled=n_view == 0,
-            ):
+            if st.button("Prepare certificate ZIP", key="prep_cert_zip", disabled=n_view == 0, **_STRETCH):
                 with st.spinner(f"Downloading up to {min(n_view, max_zip)} certificate PDF(s)…"):
                     zip_bytes, zip_logs = build_certificates_zip(view, max_files=max_zip)
-                st.session_state["cert_zip_bytes"] = zip_bytes
-                st.session_state["cert_zip_logs"] = zip_logs
-                st.session_state["cert_zip_name"] = f"Certificates_{date.today().isoformat()}.zip"
-
-            if st.session_state.get("cert_zip_bytes"):
-                st.download_button(
-                    "Download ZIP",
-                    data=st.session_state["cert_zip_bytes"],
-                    file_name=st.session_state.get("cert_zip_name") or "Certificates.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    key="dl_cert_zip",
+                st.session_state.update(
+                    cert_zip_bytes=zip_bytes, cert_zip_logs=zip_logs, cert_zip_key=zip_key,
+                    cert_zip_name=f"Certificates_{date.today().isoformat()}.zip",
                 )
-                logs = st.session_state.get("cert_zip_logs") or []
-                if logs:
-                    ok_n = sum(1 for x in logs if x.get("Status") == "OK")
-                    st.caption(f"ZIP ready: {ok_n}/{len(logs)} PDF(s) included")
-                    with st.expander("Download log"):
-                        st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
-            elif st.session_state.get("cert_zip_logs"):
+
+            zip_ready = st.session_state.get("cert_zip_key") == zip_key
+            logs = st.session_state.get("cert_zip_logs") or []
+            if zip_ready and st.session_state.get("cert_zip_bytes"):
+                st.download_button(
+                    "Download ZIP", data=st.session_state["cert_zip_bytes"],
+                    file_name=st.session_state.get("cert_zip_name") or "Certificates.zip",
+                    mime="application/zip", key="dl_cert_zip", **_STRETCH,
+                )
+                ok_n = sum(1 for x in logs if x.get("Status") == "OK")
+                st.caption(f"ZIP ready: {ok_n}/{len(logs)} PDF(s) included")
+            elif zip_ready and logs:
                 st.warning("No PDFs could be downloaded for this filter (lab block or missing files).")
+            elif st.session_state.get("cert_zip_key"):
+                st.caption("The filter changed since the ZIP was prepared — prepare it again.")
+            if zip_ready and logs:
                 with st.expander("Download log"):
-                    st.dataframe(
-                        pd.DataFrame(st.session_state["cert_zip_logs"]),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                    st.dataframe(pd.DataFrame(logs), hide_index=True, **_STRETCH)
 
 # =========================================================
 # TAB 3 – Edit editable fields
 # =========================================================
 with tab_edit:
+    _flash = st.session_state.pop("edit_flash", None)
+    if _flash:
+        getattr(st, _flash[0])(_flash[1])
+
     df_all = load_all_inventory()
     if df_all.empty:
         st.info("No inventory records available.")
     else:
-        # Single editable table only (no second grid)
         edit_cols = [
-            "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT",
-            "COLOR GRADE", "CLARITY GRADE",
+            "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE",
         ] + EDITABLE_COLUMNS
         edit_cols = [c for c in edit_cols if c in df_all.columns]
-        df_edit = df_all[edit_cols].copy()
+        df_edit = df_all[edit_cols].reset_index(drop=True)
+
+        edit_q = st.text_input(
+            "Filter rows", value="", key="edit_filter",
+            placeholder="Filter before editing (save pending edits first — changing the filter resets them)",
+        )
+        df_view = smart_filter(df_edit, edit_q).reset_index(drop=True) if edit_q.strip() else df_edit
 
         b1, b2, b3 = st.columns([1, 3, 1])
         with b1:
-            save_clicked = st.button("Save", type="primary", use_container_width=True)
+            save_clicked = st.button("Save", type="primary", **_STRETCH)
         with b2:
             pick_e = st.selectbox(
-                "Preview",
-                df_edit["Certificate Number"].astype(str).tolist(),
-                key="edit_preview_pick",
-                label_visibility="collapsed",
+                "Preview", df_view["Certificate Number"].astype(str).tolist(),
+                key="edit_preview_pick", label_visibility="collapsed",
             )
         with b3:
-            preview_clicked = st.button("Preview", use_container_width=True, key="edit_preview_btn")
+            preview_clicked = st.button("Preview", key="edit_preview_btn", **_STRETCH)
 
+        editor_key = f"inventory_editor_{st.session_state.get('edit_gen', 0)}_{abs(hash(edit_q))}"
         edited = st.data_editor(
-            df_edit,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            height=560,
-            key="inventory_editor",
+            df_view, hide_index=True, num_rows="fixed", height=560, key=editor_key,
             column_config={
                 "Certificate Number": st.column_config.TextColumn(disabled=True, width="small"),
                 "SHAPE AND CUT": st.column_config.TextColumn(disabled=True, width="medium"),
@@ -2490,31 +2388,47 @@ with tab_edit:
                 "COLOR GRADE": st.column_config.TextColumn(disabled=True, width="small"),
                 "CLARITY GRADE": st.column_config.TextColumn(disabled=True, width="small"),
             },
+            **_STRETCH,
         )
 
+        changes = compute_edit_changes(df_view, edited)
+        n_cells = sum(len(v) for v in changes.values())
+        if n_cells:
+            st.caption(f"{n_cells} unsaved cell change(s) in {len(changes)} row(s).")
+
         if save_clicked:
-            update_editable_fields(edited)
-            st.success("Changes saved.")
-            st.rerun()
+            if not changes:
+                st.info("No changes to save.")
+            else:
+                try:
+                    res = update_editable_fields(changes)
+                except Exception as e:
+                    logger.exception("Edit save failed")
+                    st.error(f"Save failed: {str(e)[:300]}")
+                else:
+                    conflicts = res["conflicts"]
+                    if conflicts:
+                        sample = ", ".join(f"{c} · {col}" for c, col in conflicts[:5])
+                        st.session_state["edit_flash"] = (
+                            "warning",
+                            f"Saved {res['updated']} cell(s). Skipped {len(conflicts)} cell(s) that someone "
+                            f"else changed since you loaded the table ({sample}"
+                            f"{'…' if len(conflicts) > 5 else ''}). Review and save again if needed.",
+                        )
+                    else:
+                        st.session_state["edit_flash"] = ("success", f"Saved {res['updated']} cell(s).")
+                    st.session_state["edit_gen"] = st.session_state.get("edit_gen", 0) + 1
+                    st.rerun()
 
         if preview_clicked:
             open_certificate_preview(pick_e, "")
-
-        if not HAS_DIALOG and st.session_state.get("inline_preview_cert"):
-            with st.expander(f"Certificate {st.session_state['inline_preview_cert']}", expanded=True):
-                render_certificate_preview(
-                    st.session_state["inline_preview_cert"],
-                    st.session_state.get("inline_preview_link", ""),
-                )
 
 # =========================================================
 # TAB 4 – Video links & Drive backup
 # =========================================================
 with tab_video:
     video_text = st.text_area(
-        "Certificate number and media URL",
-        value="",
-        height=180,
+        "Certificate number and media URL", value="", height=180,
         placeholder="One pair per line: certificate number, then URL (tab or space separated)",
         key="video_bulk_input",
     )
@@ -2523,20 +2437,20 @@ with tab_video:
     if st.button("Save media links", type="primary", key="save_videos_btn"):
         pairs = []
         for line in video_text.strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = re.split(r"\s+", line, maxsplit=1)
-            if len(parts) < 2:
-                continue
-            pairs.append((parts[0], parts[1]))
+            parts = re.split(r"\s+", line.strip(), maxsplit=1)
+            if len(parts) == 2:
+                pairs.append((parts[0], parts[1]))
 
         if not pairs:
             st.error("No valid certificate / URL pairs found.")
         else:
             with st.spinner("Saving…"):
-                results = save_video_urls(pairs, try_drive_backup=try_backup)
-            st.success(f"{len(results)} media link(s) saved.")
-            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+                try:
+                    results, upsert_res = save_video_urls(pairs, try_drive_backup=try_backup)
+                except RuntimeError as e:
+                    results, upsert_res = [], {"warning": str(e)}
+            report_upsert(upsert_res)
+            if results:
+                st.dataframe(pd.DataFrame(results), hide_index=True, **_STRETCH)
 
-st.markdown('<div class="app-footer">Certified Stone Inventory · FGI</div>', unsafe_allow_html=True)
+st.caption("Certified Stone Inventory · FGI")
