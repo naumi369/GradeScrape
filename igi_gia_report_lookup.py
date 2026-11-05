@@ -30,9 +30,11 @@ import pandas as pd
 import requests
 import re
 import io
+import difflib
 import hmac
 import ipaddress
 import logging
+import math
 import socket
 import sqlite3
 import os
@@ -40,7 +42,8 @@ import zipfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from datetime import datetime, date
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlparse, urljoin
 from requests.adapters import HTTPAdapter
@@ -171,7 +174,7 @@ CERT_ALLOWED_HOST_SUFFIXES = ("igi.org", "gia.edu", "amazonaws.com")
 
 MAX_PDF_BYTES = 25 * 1024 * 1024
 MAX_VIDEO_BYTES = 300 * 1024 * 1024
-CARAT_TOLERANCE = 0.12          # fractional carat search window (e.g. "1.5ct")
+CARAT_TOLERANCE = 0.12          # ± window used by "~1.5ct" / "about 1.5ct" in search
 
 FAILURE_STATUSES = {"Not Found", "Parse Error", "Link Ready", "Error", "Unknown Format"}
 
@@ -1986,110 +1989,470 @@ def parse_color_grade(text_upper: str) -> Optional[str]:
 
 
 # -------------------------------------------------
-# Inventory search (moved to module level so it can be tested)
+# Smart inventory search
+#   parse_query()    -> understands trade shorthand, ranges, lists, negation
+#   smart_filter()   -> applies it (same signature as before)
+#   describe_query() -> "Understood as: ..." chips shown under the search box
+#   suggest_terms()  -> "Did you mean ...?" when a word matches nothing
 # -------------------------------------------------
-def smart_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Filter with partial keywords, cert fragments, shape/color/clarity/carat."""
-    if df.empty or not query or not query.strip():
+SEARCH_COLUMNS = [
+    "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE", "CLARITY GRADE",
+    "Process", "FGI Item Number", "Current Location/Status", "For stock or Customer",
+    "Comment", "DESCRIPTION", "Lab", "Production Order #, if for stock",
+    "CUT", "POLISH", "SYMMETRY", "FLUORESCENCE", "MEASUREMENTS",
+]
+
+CLARITY_ORDER = ["FL", "IF", "VVS1", "VVS2", "VS1", "VS2", "SI1", "SI2", "SI3", "I1", "I2", "I3"]
+_CLARITY_TOK = r"(?:FL|IF|VVS[12]?|VS[12]?|SI[123]?|I[123])"
+COLOR_LETTERS = "DEFGHIJKLMNOPQRSTUVWXYZ"
+_COLOR_PAIRS = {"DE", "EF", "FG", "GH", "HI", "IJ", "JK", "KL"}
+
+# canonical shape -> (regex on the stored "SHAPE AND CUT" text, accepted query words)
+# GIA/IGI name some shapes by cut style, so "princess" must also find "Square Modified Brilliant".
+SHAPE_DEFS: Dict[str, Tuple[str, set]] = {
+    "ROUND": (r"\bROUND\b", {"ROUND", "RD", "RB", "RND"}),
+    "OVAL": (r"\bOVAL\b", {"OVAL", "OV", "OVL"}),
+    "PEAR": (r"\bPEAR\b", {"PEAR", "PS"}),
+    "MARQUISE": (r"MARQUISE", {"MARQUISE", "MARQUIS", "MQ"}),
+    "PRINCESS": (r"PRINCESS|(?<!CORNERED )SQUARE MODIFIED BRILLIANT", {"PRINCESS", "PR", "PRN"}),
+    "CUSHION": (r"CUSHION", {"CUSHION", "CU", "CUS", "CB"}),
+    "EMERALD": (r"(?<!SQUARE )EMERALD", {"EMERALD", "EM", "EMD"}),
+    "ASSCHER": (r"ASSCHER|SQUARE EMERALD", {"ASSCHER", "AS", "ASH"}),
+    "RADIANT": (r"RADIANT|CUT[ -]CORNERED (?:RECTANGULAR|SQUARE) MODIFIED BRILLIANT", {"RADIANT", "RAD"}),
+    "HEART": (r"HEART", {"HEART", "HS", "HT"}),
+    "TRIANGLE": (r"TRILLIANT|TRIANGLE", {"TRILLIANT", "TRILLION", "TRIANGLE", "TR"}),
+    "BAGUETTE": (r"BAGUETTE", {"BAGUETTE", "BAG"}),
+}
+SEARCH_HELP = (
+    "Mix any of these in one box:\n"
+    "• Shape: round, oval, pear… or trade codes RD, OV, PS, PR, EM, CU, MQ, RAD, AS, HS\n"
+    "• Carat: 1.5ct (1.50–1.59), 1ct (1.00–1.99), 1.52ct (exact), 1-2ct, >1.5, under 2ct, 2ct+, ~1.5ct\n"
+    "• Colour: F, D-F, DEF, 'color G'   • Clarity: VS1, VS (VS1+VS2), VS1-SI1, VS+ (VS or better)\n"
+    "• Process/lab: cvd, hpht, igi, gia   • Grades: 3EX\n"
+    "• Price: under $5000, $2k-4k, >$1000   • Media: video, 'no video'\n"
+    "• Dates: today, yesterday, last 7 days, this month, 2026-11-01..2026-11-05 (start with updated / shipped to change the field)\n"
+    "• Certificates: paste several (LG123, LG456) to match any   • Exclude: -hpht   • Exact phrase: \"in vault\""
+)
+
+_SHAPE_ALIAS = {a: name for name, (_, al) in SHAPE_DEFS.items() for a in al}
+
+_STOPWORDS = {
+    "SHOW", "ME", "IN", "THE", "WITH", "AND", "OF", "FOR", "ALL", "ANY", "LIST", "FIND", "SEARCH",
+    "PLEASE", "STONE", "STONES", "DIAMOND", "DIAMONDS", "CT", "CTS", "CARAT", "CARATS", "COLOR",
+    "CLARITY", "SHAPE", "CUT", "GRADE", "MM", "OR", "A", "AN", "TO",
+}
+
+_NUM = r"\d+(?:\.\d+)?"
+
+
+# ---- Date filtering (shared by the date-range control and the search box) ----
+DATE_FIELDS = {
+    "Added": "date_added",
+    "Updated": "last_updated",
+    "Shipped from India": "Date Shipped from India",
+}
+SHIPPED_DATE_DAYFIRST = True     # free-text shipping dates like 05/11/2026 are read as day/month/year
+
+
+def _date_series(df: pd.DataFrame, col: str) -> pd.Series:
+    """Parse a text date column to midnight timestamps (NaT where blank/unreadable)."""
+    if col not in df.columns:
+        return pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    raw = df[col].fillna("").astype(str).str.strip()
+    dayfirst = SHIPPED_DATE_DAYFIRST if col == "Date Shipped from India" else False
+    try:
+        out = pd.to_datetime(raw, errors="coerce", dayfirst=dayfirst, format="mixed")
+    except (TypeError, ValueError):               # older pandas without format="mixed"
+        out = pd.to_datetime(raw, errors="coerce", dayfirst=dayfirst)
+    return out.dt.normalize()
+
+
+def filter_by_date(df: pd.DataFrame, col: str, lo: date, hi: date) -> pd.DataFrame:
+    if df.empty:
         return df
+    lo, hi = min(lo, hi), max(lo, hi)
+    ds = _date_series(df, col)
+    return df[(ds >= pd.Timestamp(lo)) & (ds <= pd.Timestamp(hi))]
 
-    q = query.strip().upper()
-    mask = pd.Series([True] * len(df), index=df.index)
-    search_cols = [
-        c for c in [
-            "Certificate Number", "SHAPE AND CUT", "CARAT WEIGHT", "COLOR GRADE",
-            "CLARITY GRADE", "Process", "FGI Item Number", "Current Location/Status",
-            "For stock or Customer", "Comment", "DESCRIPTION", "Lab",
-            "Production Order #, if for stock",
-        ] if c in df.columns
-    ]
 
-    # --- Structured filters (AND) ---
-    carat_m = re.search(r"(\d+\.?\d*)\s*(?:CT|CARAT|CTS|CARATS)\b", q)
-    if carat_m and "CARAT WEIGHT" in df.columns:
-        target = float(carat_m.group(1))
-        is_whole = abs(target - round(target)) < 1e-9
+def date_preset_range(label: str) -> Optional[Tuple[date, date]]:
+    today = date.today()
+    if label == "Today":
+        return today, today
+    if label == "Yesterday":
+        y = today - timedelta(days=1)
+        return y, y
+    if label == "Last 7 days":
+        return today - timedelta(days=6), today
+    if label == "Last 30 days":
+        return today - timedelta(days=29), today
+    if label == "This week":
+        return today - timedelta(days=today.weekday()), today
+    if label == "This month":
+        return today.replace(day=1), today
+    if label == "Last month":
+        first_this = today.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        return last_prev.replace(day=1), last_prev
+    return None
 
-        def _near_carat(val):
-            try:
-                num = float(re.search(r"[\d.]+", str(val).upper()).group())
-                if is_whole:
-                    return target <= num < target + 1.0
-                return abs(num - target) <= CARAT_TOLERANCE
-            except Exception:
-                return False
 
-        mask &= df["CARAT WEIGHT"].apply(_near_carat)
+DATE_PRESETS = ["Any date", "Today", "Yesterday", "Last 7 days", "Last 30 days",
+                "This week", "This month", "Last month", "Custom range"]
 
-    shapes = [
-        "ROUND", "OVAL", "PEAR", "MARQUISE", "PRINCESS", "CUSHION",
-        "EMERALD", "RADIANT", "HEART", "ASSCHER", "RECTANGULAR", "SQUARE",
-        "BRILLIANT", "CUT CORNERED",
-    ]
-    for shape in shapes:
-        if re.search(rf"\b{shape}\b", q) and "SHAPE AND CUT" in df.columns:
-            mask &= df["SHAPE AND CUT"].astype(str).str.upper().str.contains(shape, na=False)
 
-    color_m2 = re.search(r"(?:COLOR|COLOUR)\s*([D-Z])\b|\b([D-Z])\s*(?:COLOR|COLOUR)\b", q)
-    if color_m2 and "COLOR GRADE" in df.columns:
-        letter = color_m2.group(1) or color_m2.group(2)
-        mask &= df["COLOR GRADE"].astype(str).str.upper() == letter
+@dataclass
+class ParsedQuery:
+    raw: str = ""
+    certs: List[str] = field(default_factory=list)
+    carat: Optional[Tuple[float, float]] = None
+    price: Optional[Tuple[float, float]] = None
+    shapes: List[str] = field(default_factory=list)
+    colors: List[str] = field(default_factory=list)
+    clarities: List[str] = field(default_factory=list)
+    processes: List[str] = field(default_factory=list)
+    labs: List[str] = field(default_factory=list)
+    three_ex: bool = False
+    has_video: Optional[bool] = None
+    date_field: str = "date_added"
+    date_range: Optional[Tuple[date, date]] = None
+    phrases: List[str] = field(default_factory=list)
+    terms: List[str] = field(default_factory=list)
+    negatives: List[str] = field(default_factory=list)
+    ignored: List[str] = field(default_factory=list)
 
-    clar_m = re.search(
-        r"\b(FL|IF|VVS\s*1|VVS\s*2|VVS1|VVS2|VS\s*1|VS\s*2|VS1|VS2|"
-        r"SI\s*1|SI\s*2|SI1|SI2|I\s*1|I\s*2|I\s*3|I1|I2|I3)\b",
-        q,
-    )
-    if clar_m and "CLARITY GRADE" in df.columns:
-        clar = re.sub(r"\s+", "", clar_m.group(1)).upper()
-        mask &= df["CLARITY GRADE"].astype(str).str.upper().str.replace(" ", "", regex=False) == clar
+    @property
+    def is_empty(self) -> bool:
+        return not any([
+            self.certs, self.carat, self.price, self.shapes, self.colors, self.clarities,
+            self.processes, self.labs, self.three_ex, self.has_video is not None, self.date_range,
+            self.phrases, self.terms, self.negatives,
+        ])
 
-    if re.search(r"\bCVD\b", q) and "Process" in df.columns:
-        mask &= df["Process"].astype(str).str.upper().str.contains("CVD", na=False)
-    if re.search(r"\bHPHT\b", q) and "Process" in df.columns:
-        mask &= df["Process"].astype(str).str.upper().str.contains("HPHT", na=False)
 
-    # --- Partial keyword / cert fragment tokens (AND across tokens) ---
-    tokens = re.findall(r"[A-Z0-9]{2,}", q)
-    skip = {
-        "CT", "CARAT", "CARATS", "CTS", "SHOW", "ME", "IN", "THE", "WITH", "AND",
-        "COLOR", "COLOUR", "CLARITY", "SHAPE", "CUT", "GRADE", "CVD", "HPHT",
-    }
-    skip |= set(shapes)
-    for tok in tokens:
-        if tok in skip:
+def _carat_interval(txt: str) -> Tuple[float, float]:
+    """Trade-style reading of a typed carat: '1' -> 1.00–1.99, '1.5' -> 1.50–1.59, '1.52' -> exactly 1.52."""
+    v = float(txt)
+    dec = len(txt.split(".")[1]) if "." in txt else 0
+    if dec == 0:
+        return v, v + 0.995
+    if dec == 1:
+        return v, v + 0.095
+    return v - 0.005, v + 0.005
+
+
+def _intersect(cur: Optional[Tuple[float, float]], new: Tuple[float, float]) -> Tuple[float, float]:
+    return new if cur is None else (max(cur[0], new[0]), min(cur[1], new[1]))
+
+
+def _expand_clarity(tok: str) -> List[str]:
+    return {"VVS": ["VVS1", "VVS2"], "VS": ["VS1", "VS2"], "SI": ["SI1", "SI2", "SI3"]}.get(tok, [tok])
+
+
+def _color_span(a: str, b: str) -> List[str]:
+    i, j = sorted((COLOR_LETTERS.index(a), COLOR_LETTERS.index(b)))
+    return list(COLOR_LETTERS[i:j + 1])
+
+
+def parse_query(query: str) -> ParsedQuery:
+    pq = ParsedQuery(raw=query or "")
+    q = " " + (query or "").upper().replace("“", '"').replace("”", '"').replace("COLOUR", "COLOR") + " "
+    q = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", q)       # 5,000 -> 5000
+    q = re.sub(r"(?<=\d),(?=\d{1,2}(?!\d))", ".", q)    # 1,5ct -> 1.5ct
+    q = re.sub(r"\b(VVS|VS|SI|I)\s*-?\s*([123])\b", r"\1\2", q)   # "VS 1" / "VS-1" -> VS1
+
+    def take(pattern: str):
+        """Return all matches of pattern and blank them out of the working string."""
+        nonlocal q
+        found = list(re.finditer(pattern, q))
+        if found:
+            q = re.sub(pattern, " ", q)
+        return found
+
+    def kval(num: str, k: Optional[str]) -> float:
+        return float(num) * (1000 if k else 1)
+
+    # --- quoted phrases ---
+    for m in take(r'"([^"]+)"'):
+        pq.phrases.append(m.group(1).strip())
+
+    # --- dates: "today", "last 14 days", "added 2026-11-01..2026-11-05", "shipped 2026-10-30" ---
+    _fld = r"(ADDED|UPDATED|SHIPPED)"
+
+    def _set_date(word: Optional[str], lo: date, hi: date) -> None:
+        pq.date_field = {"UPDATED": "last_updated", "SHIPPED": "Date Shipped from India"}.get(word or "", "date_added")
+        pq.date_range = (min(lo, hi), max(lo, hi))
+
+    for m in take(rf"\b(?:{_fld}\s+)?(\d{{4}}-\d{{2}}-\d{{2}})(?:\s*(?:\.\.|TO)\s*(\d{{4}}-\d{{2}}-\d{{2}}))?\b"):
+        try:
+            d1 = date.fromisoformat(m.group(2))
+            d2 = date.fromisoformat(m.group(3)) if m.group(3) else d1
+        except ValueError:
+            pq.ignored.append(m.group(0).strip())
             continue
-        if re.match(r"^\d+\.?\d*(CT|CARAT|CTS|CARATS)$", tok):
-            continue
-        if re.match(r"^(FL|IF|VVS[12]?|VS[12]?|SI[12]?|I[123]?)$", tok):
-            continue
-        # Digit-only or short cert-like → prefer certificate number partial match
-        if re.match(r"^\d{3,}$", tok) or (tok.startswith("LG") and len(tok) >= 4):
-            if "Certificate Number" in df.columns:
-                mask &= df["Certificate Number"].astype(str).str.upper().str.contains(
-                    re.escape(tok), na=False
-                )
-            continue
-        # General partial: token must appear in any searchable column
-        if search_cols:
-            sub = pd.Series([False] * len(df), index=df.index)
-            for c in search_cols:
-                sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
-            mask &= sub
+        _set_date(m.group(1), d1, d2)
+    for m in take(rf"\b(?:{_fld}\s+)?(TODAY|YESTERDAY|THIS\s+WEEK|THIS\s+MONTH|LAST\s+MONTH|LAST\s+(\d+)\s+(DAY|WEEK|MONTH)S?)\b"):
+        phrase = re.sub(r"\s+", " ", m.group(2)).title()
+        rng = date_preset_range(phrase)
+        if rng is None and m.group(3):
+            n, unit, today = int(m.group(3)), m.group(4), date.today()
+            if unit == "MONTH":
+                lo = (pd.Timestamp(today) - pd.DateOffset(months=n)).date() + timedelta(days=1)
+            else:
+                lo = today - timedelta(days=(n * (7 if unit == "WEEK" else 1)) - 1)
+            rng = (lo, today)
+        if rng:
+            _set_date(m.group(1), *rng)
 
-    # If query is a single short fragment with no structured hit, still partial-search all
-    if len(tokens) == 1 and tokens[0] not in skip and search_cols:
-        tok = tokens[0]
-        if not (
-            carat_m or color_m2 or clar_m
-            or any(re.search(rf"\b{s}\b", q) for s in shapes)
-        ):
-            sub = pd.Series([False] * len(df), index=df.index)
-            for c in search_cols:
-                sub |= df[c].astype(str).str.upper().str.contains(re.escape(tok), na=False)
-            mask = sub
+    # --- video flags ---
+    if take(r"\bNO\s*VIDEOS?\b|\bWITHOUT\s+VIDEOS?\b|(?<!\S)-VIDEOS?\b"):
+        pq.has_video = False
+    if take(r"\bWITH\s+VIDEOS?\b|\bVIDEOS?\b"):
+        pq.has_video = True if pq.has_video is None else pq.has_video
 
+    # --- exclusions: -word (taken early so "-hpht" is not read as a process filter) ---
+    for m in take(r"(?<!\S)-([A-Z0-9]{2,})\b"):
+        pq.negatives.append(m.group(1))
+
+    # --- price (needs a $ so it never collides with carat) ---
+    for m in take(rf"\$\s*({_NUM})\s*(K)?\s*(?:-|TO)\s*\$?\s*({_NUM})\s*(K)?"):
+        pq.price = _intersect(pq.price, (kval(m.group(1), m.group(2)), kval(m.group(3), m.group(4))))
+    for m in take(rf"(?:UNDER|BELOW|MAX|<=?)\s*\$\s*({_NUM})\s*(K)?"):
+        pq.price = _intersect(pq.price, (0.0, kval(m.group(1), m.group(2))))
+    for m in take(rf"(?:OVER|ABOVE|MIN|>=?)\s*\$\s*({_NUM})\s*(K)?"):
+        pq.price = _intersect(pq.price, (kval(m.group(1), m.group(2)), float("inf")))
+    for m in take(rf"\$\s*({_NUM})\s*(K)?"):                       # lone $N -> around N (±10%)
+        v = kval(m.group(1), m.group(2))
+        pq.price = _intersect(pq.price, (v * 0.9, v * 1.1))
+
+    # --- carat ---
+    unit = r"(?:CTS?|CARATS?)"
+    nb = r"(?<![A-Z0-9.])"
+    for m in take(rf"{nb}({_NUM})\s*(?:-|TO)\s*({_NUM})\s*{unit}\b"):
+        pq.carat = _intersect(pq.carat, (float(m.group(1)), float(m.group(2)) + 0.004))
+    for m in take(rf"(?:UNDER|BELOW|MAX|<=?)\s*({_NUM})\s*(?:{unit}\b)?"):
+        pq.carat = _intersect(pq.carat, (0.0, float(m.group(1)) + 0.004))
+    for m in take(rf"(?:OVER|ABOVE|MIN|>=?)\s*({_NUM})\s*(?:{unit}\b)?"):
+        pq.carat = _intersect(pq.carat, (float(m.group(1)) - 0.004, float("inf")))
+    for m in take(rf"{nb}({_NUM})\s*(?:{unit})?\s*\+"):
+        pq.carat = _intersect(pq.carat, (float(m.group(1)) - 0.004, float("inf")))
+    for m in take(rf"(?:~|ABOUT|AROUND|APPROX\.?)\s*({_NUM})\s*(?:{unit}\b)?"):
+        v = float(m.group(1))
+        pq.carat = _intersect(pq.carat, (v - CARAT_TOLERANCE, v + CARAT_TOLERANCE))
+    for m in take(rf"{nb}({_NUM})\s*{unit}\b"):
+        pq.carat = _intersect(pq.carat, _carat_interval(m.group(1)))
+    for m in take(rf"{nb}(\d{{1,2}}\.\d{{1,2}})(?![\d.]|\s*(?:MM|X)\b)"):   # bare "1.51" is a carat
+        pq.carat = _intersect(pq.carat, _carat_interval(m.group(1)))
+
+    # --- certificate numbers / fragments (several => match ANY, so pasted lists work) ---
+    for m in take(r"\bLG\w{3,}\b|\b\d{4,}\b"):
+        pq.certs.append(m.group(0))
+
+    # --- clarity: ranges, "VS1+", groups ("VS"), singles ---
+    for m in take(rf"\b({_CLARITY_TOK})\s*(?:-|TO)\s*({_CLARITY_TOK})\b"):
+        a, b = _expand_clarity(m.group(1))[0], _expand_clarity(m.group(2))[-1]
+        i, j = sorted((CLARITY_ORDER.index(a), CLARITY_ORDER.index(b)))
+        pq.clarities += CLARITY_ORDER[i:j + 1]
+    for m in take(rf"\b({_CLARITY_TOK})\s*(?:\+|OR\s+BETTER)"):
+        pq.clarities += CLARITY_ORDER[:CLARITY_ORDER.index(_expand_clarity(m.group(1))[-1]) + 1]
+    for m in take(rf"\b({_CLARITY_TOK})\b"):
+        pq.clarities += _expand_clarity(m.group(1))
+
+    # --- colour: "color G", "D-F", trade groups "DEF", bare letters ---
+    for m in take(r"\bCOLOR\s*:?\s*([D-Z])\b|\b([D-Z])\s+COLOR\b"):
+        pq.colors.append(m.group(1) or m.group(2))
+    for m in take(r"\b([D-Z])\s*-\s*([D-Z])\b"):
+        pq.colors += _color_span(m.group(1), m.group(2))
+    def _color_group(m):
+        s = m.group(1)
+        consecutive = all(ord(s[i + 1]) - ord(s[i]) == 1 for i in range(len(s) - 1))
+        if consecutive and (len(s) >= 3 or s in _COLOR_PAIRS):
+            pq.colors.extend(s)
+            return " "
+        return m.group(0)
+
+    q = re.sub(r"\b([D-Z]{2,4})\b", _color_group, q)
+    for m in take(r"(?<![\w$])([D-Z])(?![\w$])"):
+        pq.colors.append(m.group(1))
+
+    # --- shapes (several => match ANY) ---
+    alias_re = r"\b(" + "|".join(sorted(map(re.escape, _SHAPE_ALIAS), key=len, reverse=True)) + r")\b"
+    for m in take(alias_re):
+        pq.shapes.append(_SHAPE_ALIAS[m.group(1)])
+
+    # --- process / lab / grades ---
+    for m in take(r"\b(CVD|HPHT)\b"):
+        pq.processes.append(m.group(1))
+    for m in take(r"\b(IGI|GIA)\b"):
+        pq.labs.append(m.group(1))
+    if take(r"\b3\s*EX\b|\bEX\s+EX\s+EX\b|\b3X\b"):
+        pq.three_ex = True
+
+    # --- whatever is left: free-text terms (all must match) ---
+    for tok in re.findall(r"[A-Z0-9][A-Z0-9#/.\-]*", q):
+        tok = tok.strip(".-")
+        if not tok or tok in _STOPWORDS:
+            continue
+        if len(tok) < 2:
+            pq.ignored.append(tok)
+        else:
+            pq.terms.append(tok)
+
+    # de-duplicate, keep order
+    for attr in ("certs", "shapes", "colors", "clarities", "processes", "labs"):
+        setattr(pq, attr, list(dict.fromkeys(getattr(pq, attr))))
+    if pq.clarities:
+        pq.clarities = [c for c in CLARITY_ORDER if c in set(pq.clarities)]
+    return pq
+
+
+def _blob(df: pd.DataFrame) -> pd.Series:
+    cols = [c for c in SEARCH_COLUMNS if c in df.columns]
+    if not cols:
+        return pd.Series([""] * len(df), index=df.index)
+    out = df[cols[0]].fillna("").astype(str)
+    for c in cols[1:]:
+        out = out + " | " + df[c].fillna("").astype(str)
+    return out.str.upper()
+
+
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    return df[name].fillna("").astype(str).str.strip().str.upper() if name in df.columns \
+        else pd.Series([""] * len(df), index=df.index)
+
+
+def apply_query(df: pd.DataFrame, pq: ParsedQuery) -> pd.DataFrame:
+    if df.empty or pq.is_empty:
+        return df
+    mask = pd.Series(True, index=df.index)
+    blob = _blob(df)
+
+    if pq.certs:
+        certcol = _col(df, "Certificate Number")
+        hit = pd.Series(False, index=df.index)
+        for c in pq.certs:
+            hit |= certcol.str.contains(c, regex=False)
+        mask &= hit
+
+    if pq.carat and "CARAT WEIGHT" in df.columns:
+        lo, hi = pq.carat
+        num = df["CARAT WEIGHT"].map(_parse_carat)
+        mask &= (num > 0) & (num >= lo - 1e-9) & (num <= hi + 1e-9)
+
+    if pq.price:
+        lo, hi = pq.price
+        stone = df["Price For stone"].map(_parse_money) if "Price For stone" in df.columns else 0.0
+        per_ct = df["Price Per Carat"].map(_parse_money) if "Price Per Carat" in df.columns else 0.0
+        carat = df["CARAT WEIGHT"].map(_parse_carat) if "CARAT WEIGHT" in df.columns else 0.0
+        price = stone.where(stone > 0, per_ct * carat) if hasattr(stone, "where") else stone
+        mask &= (price > 0) & (price >= lo) & (price <= hi)
+
+    if pq.shapes:
+        shape_col = _col(df, "SHAPE AND CUT")
+        hit = pd.Series(False, index=df.index)
+        for s in pq.shapes:
+            hit |= shape_col.str.contains(SHAPE_DEFS[s][0], regex=True)
+        mask &= hit
+
+    if pq.colors:
+        mask &= _col(df, "COLOR GRADE").isin(pq.colors)
+    if pq.clarities:
+        mask &= _col(df, "CLARITY GRADE").str.replace(" ", "", regex=False).isin(pq.clarities)
+    if pq.processes:
+        proc = _col(df, "Process")
+        hit = pd.Series(False, index=df.index)
+        for p in pq.processes:
+            hit |= proc.str.contains(p, regex=False)
+        mask &= hit
+    if pq.labs:
+        mask &= _col(df, "Lab").isin(pq.labs)
+    if pq.three_ex:
+        cut_ok = _col(df, "CUT").isin(["EXCELLENT", "IDEAL", ""])      # fancy shapes carry no cut grade
+        mask &= (_col(df, "POLISH") == "EXCELLENT") & (_col(df, "SYMMETRY") == "EXCELLENT") & cut_ok
+    if pq.has_video is not None:
+        has = (_col(df, "Video URL") != "") | (_col(df, "Video Backup Drive Link") != "")
+        mask &= has if pq.has_video else ~has
+
+    if pq.date_range:
+        ds = _date_series(df, pq.date_field)
+        lo, hi = pq.date_range
+        mask &= (ds >= pd.Timestamp(lo)) & (ds <= pd.Timestamp(hi))
+
+    for ph in pq.phrases:
+        mask &= blob.str.contains(ph, regex=False)
+    for t in pq.terms:
+        mask &= blob.str.contains(t, regex=False)
+    for n in pq.negatives:
+        mask &= ~blob.str.contains(n, regex=False)
     return df[mask]
+
+
+def smart_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Filter inventory by a free-text query (see parse_query for what is understood)."""
+    if df is None or df.empty or not query or not query.strip():
+        return df
+    return apply_query(df, parse_query(query))
+
+
+def _fmt(v: float) -> str:
+    return "∞" if v == float("inf") else (f"{v:.2f}")
+
+
+def describe_query(pq: ParsedQuery) -> List[str]:
+    """Human-readable chips so the user can see exactly how the query was read."""
+    chips: List[str] = []
+    if pq.certs:
+        chips.append("Certificate: " + " / ".join(pq.certs))
+    if pq.shapes:
+        chips.append("Shape: " + " or ".join(s.title() for s in pq.shapes))
+    if pq.carat:
+        lo, hi = pq.carat
+        lo_c = math.ceil(max(lo, 0) * 100 - 1e-6) / 100          # show the range the way jewellers read it
+        if hi == float("inf"):
+            chips.append(f"Carat: {lo_c:.2f}+")
+        else:
+            chips.append(f"Carat: {lo_c:.2f}–{math.floor(hi * 100 + 1e-6) / 100:.2f}")
+    if pq.colors:
+        chips.append("Colour: " + ", ".join(sorted(set(pq.colors))))
+    if pq.clarities:
+        chips.append("Clarity: " + ", ".join(pq.clarities))
+    if pq.price:
+        lo, hi = pq.price
+        chips.append(f"Price: ${lo:,.0f}+" if hi == float("inf") else f"Price: ${lo:,.0f}–${hi:,.0f}")
+    if pq.processes:
+        chips.append("Process: " + " / ".join(pq.processes))
+    if pq.labs:
+        chips.append("Lab: " + " / ".join(pq.labs))
+    if pq.three_ex:
+        chips.append("3EX (polish & symmetry Excellent, cut Excellent/Ideal if graded)")
+    if pq.has_video is not None:
+        chips.append("Has video" if pq.has_video else "No video")
+    if pq.date_range:
+        label = {v: k for k, v in DATE_FIELDS.items()}.get(pq.date_field, "Added")
+        lo, hi = pq.date_range
+        chips.append(f"{label}: {lo}" if lo == hi else f"{label}: {lo} → {hi}")
+    if pq.phrases:
+        chips.append("Phrase: " + ", ".join(f'"{p.lower()}"' for p in pq.phrases))
+    if pq.terms:
+        chips.append("Contains: " + ", ".join(t.lower() for t in pq.terms))
+    if pq.negatives:
+        chips.append("Excluding: " + ", ".join(n.lower() for n in pq.negatives))
+    return chips
+
+
+def suggest_terms(df: pd.DataFrame, pq: ParsedQuery) -> List[str]:
+    """For free-text words that match nothing, propose the closest word actually present in the data."""
+    if df is None or df.empty or not pq.terms:
+        return []
+    blob = _blob(df)
+    vocab = sorted(set(re.findall(r"[A-Z][A-Z]{3,}", " ".join(blob.head(3000).tolist()))))
+    out = []
+    for t in pq.terms:
+        if len(t) >= 4 and not blob.str.contains(t, regex=False).any():
+            close = difflib.get_close_matches(t, vocab, n=1, cutoff=0.72)
+            if close:
+                out.append(f"'{t.lower()}' → '{close[0].lower()}'")
+    return out
 
 
 # -------------------------------------------------
@@ -2263,23 +2626,50 @@ with tab_add:
 with tab_all:
     df_all = load_all_inventory()
 
-    t1, t2, t3 = st.columns([3, 1, 1])
+    t1, t2, t3, t4 = st.columns([3, 1, 1.3, 1.3])
     with t1:
         search_q = st.text_input(
             "Search", value="",
-            placeholder="Search by certificate, shape, color, clarity, carat…",
+            placeholder="Try: round 1.5ct F VS1  ·  oval 2-3ct D-F VS+ cvd  ·  emerald -hpht  ·  LG6123, LG6987",
             label_visibility="collapsed", key="inventory_search",
+            help=SEARCH_HELP,
         )
     with t2:
         filter_lab = st.selectbox("Lab", ["All", "IGI", "GIA", "Unknown"], key="lab_filter", label_visibility="collapsed")
     with t3:
-        filter_today = st.checkbox("Today only", value=False, key="today_filter")
+        date_preset = st.selectbox("Date range", DATE_PRESETS, key="date_preset", label_visibility="collapsed")
+    with t4:
+        date_field_label = st.selectbox(
+            "Date field", list(DATE_FIELDS), key="date_field", label_visibility="collapsed",
+            help="Which date the range applies to: when the record was added, last updated, or shipped from India.",
+        )
+
+    if date_preset == "Custom range":
+        picked = st.date_input(
+            "Custom range", value=(date.today() - timedelta(days=7), date.today()), key="date_custom",
+        )
+        if isinstance(picked, (tuple, list)):
+            picked = tuple(picked)
+            _drange = (picked[0], picked[-1]) if picked else None     # 1 date picked so far -> that single day
+        else:
+            _drange = (picked, picked)
+    else:
+        _drange = date_preset_range(date_preset)
+
+    if _drange:
+        _lo, _hi = min(_drange), max(_drange)
+        st.caption(f"{date_field_label}: {_lo}" if _lo == _hi else f"{date_field_label}: {_lo} → {_hi}")
+    _pq = parse_query(search_q) if search_q.strip() else None
+    if _pq is not None and not _pq.is_empty:
+        st.caption("Understood as: " + "  ·  ".join(describe_query(_pq)))
+    if _pq is not None and _pq.ignored:
+        st.caption("Ignored: " + ", ".join(_pq.ignored))
 
     view = df_all.copy()
     if filter_lab != "All" and not view.empty:
         view = view[view["Lab"] == filter_lab]
-    if filter_today and not view.empty:
-        view = view[view["date_added"].astype(str).str.startswith(date.today().isoformat())]
+    if _drange and not view.empty:
+        view = filter_by_date(view, DATE_FIELDS[date_field_label], _drange[0], _drange[1])
     if search_q.strip() and not view.empty:
         view = smart_filter(view, search_q)
 
@@ -2294,6 +2684,10 @@ with tab_all:
     render_inventory_subtotals(view, title=f"{len(view)}/{len(df_all)} shown")
     if view.empty:
         st.info("No matching records.")
+        if _pq is not None:
+            _tips = suggest_terms(df_all, _pq)
+            if _tips:
+                st.caption("Did you mean: " + "; ".join(_tips) + "?")
     else:
         event = st.dataframe(
             display_df, hide_index=True, height=600,
