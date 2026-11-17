@@ -22,6 +22,8 @@ Revision notes (vs. previous version)
     save status is honest (no false "saved" on quota fallback).
   * Parsers consolidated into one code path; lab detection / shape matching fixed.
   * Certificate ZIP and preview downloads are parallel / cached.
+  * Item codes + standard $/ct are filled from Price_List_and_Code.xlsx on save
+    (IGI lab-grown -> LCD 5L tier, GIA -> GIA Cert sheet); see "Pricing codes" tab.
   * Dead Playwright code and Streamlit-compat fallbacks removed
     (requires a Streamlit version with st.dialog and dataframe selection).
 """
@@ -447,6 +449,7 @@ def merge_row(new: Dict[str, Any], old: Optional[Dict[str, Any]]) -> Optional[Di
         out = dict(new)
         out["date_added"] = out["date_added"] or now
         out["last_updated"] = now
+        _autofill_pricing(out, None)
         return out
 
     old = _normalize_row(old)
@@ -459,6 +462,7 @@ def merge_row(new: Dict[str, Any], old: Optional[Dict[str, Any]]) -> Optional[Di
             if new[col] and new[col] != old[col]:
                 out[col] = new[col]
                 changed = True
+        changed = _autofill_pricing(out, old) or changed
         if not changed:
             return None
         out["last_updated"] = now
@@ -472,6 +476,7 @@ def merge_row(new: Dict[str, Any], old: Optional[Dict[str, Any]]) -> Optional[Di
         if new[col] and new[col] != old[col]:
             out[col] = new[col]
             changed = True
+    changed = _autofill_pricing(out, old) or changed
     if not changed:
         return None
     out["date_added"] = old["date_added"] or new["date_added"] or now
@@ -2020,7 +2025,7 @@ SHAPE_DEFS: Dict[str, Tuple[str, set]] = {
     "ASSCHER": (r"ASSCHER|SQUARE EMERALD", {"ASSCHER", "AS", "ASH"}),
     "RADIANT": (r"RADIANT|CUT[ -]CORNERED (?:RECTANGULAR|SQUARE) MODIFIED BRILLIANT", {"RADIANT", "RAD"}),
     "HEART": (r"HEART", {"HEART", "HS", "HT"}),
-    "TRIANGLE": (r"TRILLIANT|TRIANGLE", {"TRILLIANT", "TRILLION", "TRIANGLE", "TR"}),
+    "TRIANGLE": (r"TRILLIANT|TRILLION|TRIANGL|TRIANGUL", {"TRILLIANT", "TRILLION", "TRIANGLE", "TR"}),
     "BAGUETTE": (r"BAGUETTE", {"BAGUETTE", "BAG"}),
 }
 SEARCH_HELP = (
@@ -2456,6 +2461,333 @@ def suggest_terms(df: pd.DataFrame, pq: ParsedQuery) -> List[str]:
 
 
 # -------------------------------------------------
+# Item codes & standard prices from the master price list (Price_List_and_Code.xlsx)
+#
+#   IGI lab-grown : <5L quality code for the shape> + roll-up range code      e.g. LR5L002000
+#   GIA mined     : <tier prefix> + roll-up range code (+ "3X")               e.g. DRK002000G / DRK002000G3X
+#
+# Tiers, size bands and prices are READ FROM THE SHEET (nothing hard-coded), so a
+# new price list can simply replace the file. Only the "Standard" columns are used.
+# Auto-filled values never overwrite something typed by hand (see _autofill_pricing).
+# -------------------------------------------------
+PRICE_LIST_FILENAME = "Price_List_and_Code.xlsx"
+GIA_REQUIRE_NO_FLUORESCENCE = True      # the GIA sheet is headed "No fluorescence"
+LCD_QUALITY_SUFFIX = "5L"               # certificate-stone tier of the LCD sheets
+
+_GIA_CLARITY_ORDER = ["FL", "IF", "VVS1", "VVS2", "VS1", "VS2", "SI1", "SI2", "SI3", "I1", "I2", "I3"]
+
+_SHEET_SHAPE_KEYS = [                   # sheet heading text -> canonical shape key
+    ("ELONGATED", "ELONGATED_CUSHION"), ("ROUND", "ROUND"), ("OVAL", "OVAL"), ("EMERALD", "EMERALD"),
+    ("PEAR", "PEAR"), ("PRINCESS", "PRINCESS"), ("MARQUISE", "MARQUISE"), ("ASSCHER", "ASSCHER"),
+    ("CUSHION", "CUSHION"), ("HEART", "HEART"), ("RADIANT", "RADIANT"), ("TRILLION", "TRILLION"),
+    ("TRIANGLE", "TRIANGLE"), ("STEP", "STEP_CUT"), ("HALF MOON", "HALF_MOON"),
+]
+_STONE_SHAPE_ORDER = ["ROUND", "OVAL", "PEAR", "MARQUISE", "HEART", "RADIANT", "PRINCESS",
+                      "CUSHION", "ASSCHER", "EMERALD", "TRIANGLE", "BAGUETTE"]
+
+
+def _price_list_path() -> str:
+    try:
+        custom = st.secrets.get("pricing", {}).get("file")
+    except Exception:
+        custom = None
+    return str(custom) if custom else os.path.join(os.path.dirname(os.path.abspath(__file__)), PRICE_LIST_FILENAME)
+
+
+def _sheet_shape_key(name: Any) -> str:
+    t = str(name or "").upper()
+    for needle, key in _SHEET_SHAPE_KEYS:
+        if needle in t:
+            return key
+    return re.sub(r"\W+", "_", t.strip()) or "UNKNOWN"
+
+
+def _band_from_row(ws, r: int, price_col: int) -> Optional[Tuple[float, float, str, Optional[float]]]:
+    rng = str(ws.cell(r, 1).value or "")
+    m = re.search(r"(\d*\.?\d+)\s*-\s*(\d*\.?\d+)", rng)
+    code = ws.cell(r, 2).value
+    if not m or code in (None, ""):
+        return None
+    code = str(code).strip()
+    if code.isdigit() and len(code) < 6:
+        code = code.zfill(6)
+    price = ws.cell(r, price_col).value
+    price = float(price) if isinstance(price, (int, float)) and not isinstance(price, bool) else None
+    return float(m.group(1)), float(m.group(2)), code, price
+
+
+def _read_bands(ws, header_row: int, price_col: int):
+    bands, r = [], header_row + 1
+    while r <= ws.max_row and str(ws.cell(r, 1).value or "").strip():
+        b = _band_from_row(ws, r, price_col)
+        if b:
+            bands.append(b)
+        r += 1
+    return bands
+
+
+def _find_row(ws, col: int, test, limit: int = 20) -> Optional[int]:
+    for r in range(1, min(ws.max_row, limit) + 1):
+        v = ws.cell(r, col).value
+        if v is not None and test(str(v).strip().upper()):
+            return r
+    return None
+
+
+def _group_start(starts: List[Tuple[int, str]], col: int) -> Optional[str]:
+    name = None
+    for c, n in starts:
+        if c <= col:
+            name = n
+    return name
+
+
+def _parse_lcd_sheet(ws, out: Dict[str, Any]) -> None:
+    shape_row = _find_row(ws, 3, lambda v: v == "SHAPE")
+    code_row = _find_row(ws, 3, lambda v: v == "QUALITY CODE")
+    head_row = _find_row(ws, 1, lambda v: "SIZE RANGE" in v)
+    if not (shape_row and code_row and head_row):
+        return
+    starts = [(c, ws.cell(shape_row, c).value) for c in range(4, ws.max_column + 1) if ws.cell(shape_row, c).value]
+    for c in range(4, ws.max_column + 1):
+        code = str(ws.cell(code_row, c).value or "").strip()
+        if not code.upper().endswith(LCD_QUALITY_SUFFIX):
+            continue
+        shape = _sheet_shape_key(_group_start(starts, c))
+        out["lcd"][shape] = {"quality": code, "bands": _read_bands(ws, head_row, c)}   # code column = "Standard"
+
+
+def _parse_gia_sheet(ws, out: Dict[str, Any]) -> None:
+    shape_row = _find_row(ws, 3, lambda v: v == "SHAPE")
+    code_row = _find_row(ws, 3, lambda v: v == "QUALITY CODE")
+    color_row = _find_row(ws, 3, lambda v: v.startswith("COLOR"))
+    clar_row = _find_row(ws, 3, lambda v: v.startswith("CLARITY"))
+    head_row = _find_row(ws, 1, lambda v: "SIZE RANGE" in v)
+    if not all([shape_row, code_row, color_row, clar_row, head_row]):
+        return
+    starts = [(c, ws.cell(shape_row, c).value) for c in range(4, ws.max_column + 1) if ws.cell(shape_row, c).value]
+    for c in range(4, ws.max_column + 1):
+        m = re.match(r"([A-Z]+)\((.*)\)", str(ws.cell(code_row, c).value or "").strip().upper())
+        if not m:
+            continue
+        prefix, paren = m.group(1), m.group(2)
+        variant = "3X" if "3X" in paren else ""
+        color = str(ws.cell(color_row, c).value or "").strip().upper()
+        clarity = str(ws.cell(clar_row, c).value or "").strip().upper()
+        if not color or clarity not in _GIA_CLARITY_ORDER:
+            continue
+        shape = _sheet_shape_key(_group_start(starts, c))
+        tiers = out["gia"].setdefault(shape, {})
+        tier = tiers.setdefault(prefix, {"prefix": prefix, "max_color": color, "min_clarity": clarity, "variants": {}})
+        tier["variants"][variant] = _read_bands(ws, head_row, c)
+
+
+@st.cache_resource(show_spinner=False)       # same object every call (no per-row copying); keyed on file mtime
+def _load_price_tables(path: str, mtime: float) -> Dict[str, Any]:
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True)
+    out: Dict[str, Any] = {"lcd": {}, "gia": {}, "effective": {}, "source": os.path.basename(path)}
+    for ws in wb.worksheets:
+        head = f"{ws['A1'].value or ''} {ws['A2'].value or ''}".upper()
+        m = re.search(r"EFFECTIVE\s+([\d./-]+)", head)
+        title = (ws.title or "").upper()
+        if "GIA" in title:
+            _parse_gia_sheet(ws, out)
+            if m:
+                out["effective"]["GIA"] = m.group(1)
+        elif "LCD" in title:
+            _parse_lcd_sheet(ws, out)
+            if m:
+                out["effective"].setdefault("LCD", m.group(1))
+    return out
+
+
+def get_price_tables() -> Optional[Dict[str, Any]]:
+    path = _price_list_path()
+    try:
+        return _load_price_tables(path, os.path.getmtime(path))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.exception("Could not read price list %s", path)
+        return None
+
+
+def stone_shape_key(shape_text: str) -> str:
+    t = str(shape_text or "").upper()
+    if not t:
+        return ""
+    if "ELONGATED" in t or "RECTANGULAR CUSHION" in t:
+        return "ELONGATED_CUSHION"
+    for key in _STONE_SHAPE_ORDER:
+        if re.search(SHAPE_DEFS[key][0], t):
+            return key
+    return ""
+
+
+def _find_band(bands, carat: float):
+    """Band containing the carat weight. Where a band's rounding allowance overlaps the next band
+    (e.g. 1.00 vs 0.90–0.999) the band with the higher lower bound wins."""
+    hits = [b for b in bands if b[0] - 1e-9 <= carat <= b[1] + 0.004]
+    return max(hits, key=lambda b: b[0]) if hits else None
+
+
+@dataclass
+class PricingResult:
+    code: str = ""
+    price: Optional[float] = None
+    reason: str = ""          # why no code/price could be produced
+    tier: str = ""
+
+
+def derive_pricing(row: Dict[str, Any], tables: Optional[Dict[str, Any]] = None) -> PricingResult:
+    """Work out the item code and standard $/ct for one stone from the price list."""
+    tables = tables if tables is not None else get_price_tables()
+    if not tables:
+        return PricingResult(reason="Price list file not found")
+    g = lambda k: str(row.get(k) or "").strip()
+    cert = g("Certificate Number")
+    lab = infer_lab(cert, g("Lab"))
+    carat = _parse_carat(g("CARAT WEIGHT"))
+    shape = stone_shape_key(g("SHAPE AND CUT"))
+    desc = g("DESCRIPTION").upper()
+    lab_grown = ("LABORATORY" in desc or "LAB GROWN" in desc or "LAB-GROWN" in desc
+                 or cert.upper().startswith("LG") or g("Process").upper() in ("CVD", "HPHT"))
+
+    if carat <= 0:
+        return PricingResult(reason="No carat weight")
+    if not shape:
+        return PricingResult(reason=f"Shape not recognised ({g('SHAPE AND CUT') or 'blank'})")
+
+    # ---------------- IGI lab-grown  ->  LCD sheets, 5L tier ----------------
+    if lab == "IGI":
+        if not lab_grown:
+            return PricingResult(reason="IGI natural stones are not in the price list")
+        tier = tables["lcd"].get(shape)
+        if not tier:
+            return PricingResult(reason=f"No {LCD_QUALITY_SUFFIX} price for {shape.replace('_', ' ').title()}")
+        band = _find_band(tier["bands"], carat)
+        if not band:
+            return PricingResult(reason=f"{carat:g} ct is outside the listed sizes")
+        if band[3] is None:
+            return PricingResult(reason=f"No {tier['quality']} price for {band[0]:g}–{band[1]:g} ct")
+        return PricingResult(code=f"{tier['quality']}{band[2]}", price=band[3], tier=tier["quality"])
+
+    # ---------------- GIA mined  ->  GIA Cert sheet ----------------
+    if lab == "GIA":
+        if lab_grown:
+            return PricingResult(reason="GIA lab-grown stones are not in the mined price list")
+        tiers = tables["gia"].get(shape)
+        if not tiers:
+            return PricingResult(reason=f"No GIA price list for {shape.replace('_', ' ').title()}")
+        colour, clarity = g("COLOR GRADE").upper(), g("CLARITY GRADE").upper().replace(" ", "")
+        if not re.fullmatch(r"[D-Z]", colour):
+            return PricingResult(reason=f"Colour '{colour or 'blank'}' is not a D–Z grade")
+        if clarity not in _GIA_CLARITY_ORDER:
+            return PricingResult(reason=f"Clarity '{clarity or 'blank'}' not recognised")
+        fluo = g("FLUORESCENCE").upper()
+        if GIA_REQUIRE_NO_FLUORESCENCE and fluo and fluo != "NONE":
+            return PricingResult(reason=f"Fluorescence {fluo.title()} (price list is for none)")
+
+        ordered = sorted(tiers.values(),
+                         key=lambda t: (t["max_color"], _GIA_CLARITY_ORDER.index(t["min_clarity"])))
+        tier = next((t for t in ordered
+                     if colour <= t["max_color"]
+                     and _GIA_CLARITY_ORDER.index(clarity) <= _GIA_CLARITY_ORDER.index(t["min_clarity"])), None)
+        if tier is None:
+            worst = ordered[-1]
+            return PricingResult(reason=f"{colour}-{clarity} is below the listed grades "
+                                        f"(needs {worst['max_color']} or better, {worst['min_clarity']} or better)")
+
+        cut, pol, sym = g("CUT").upper(), g("POLISH").upper(), g("SYMMETRY").upper()
+        good = {"EXCELLENT", "VERY GOOD", "IDEAL"}
+        cut_ok = cut in good or (cut == "" and pol in good and sym in good)   # fancy shapes carry no cut grade
+        if not cut_ok:
+            return PricingResult(reason=f"Cut below Very Good ({cut.title() or 'no cut grade'})")
+        is_3x = pol == "EXCELLENT" and sym == "EXCELLENT" and cut in ("EXCELLENT", "IDEAL", "")
+        variant = "3X" if is_3x and "3X" in tier["variants"] else ""
+        bands = tier["variants"].get(variant) or tier["variants"].get("")
+        band = _find_band(bands or [], carat)
+        if not band:
+            return PricingResult(reason=f"{carat:g} ct is outside the listed GIA sizes")
+        if band[3] is None:
+            return PricingResult(reason=f"No GIA price for {band[0]:g}–{band[1]:g} ct")
+        return PricingResult(code=f"{tier['prefix']}{band[2]}{variant}", price=band[3], tier=tier["prefix"])
+
+    return PricingResult(reason=f"Lab '{lab}' not covered by the price list")
+
+
+def format_price(v: float) -> str:
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def _autofill_pricing(row: Dict[str, str], old: Optional[Dict[str, str]]) -> bool:
+    """
+    Fill "FGI Item Number" and "Price Per Carat" from the price list. A cell is
+    (re)filled only if it is blank OR still holds what the price list produced for the
+    previous version of the row (i.e. nobody typed over it). Hand-typed values are kept.
+    """
+    res = derive_pricing(row)
+    if not res.code:
+        return False
+    prev = derive_pricing(old) if old is not None else PricingResult()
+    changed = False
+    for col, new_val, prev_val in (
+        ("FGI Item Number", res.code, prev.code),
+        ("Price Per Carat", format_price(res.price), format_price(prev.price) if prev.price is not None else ""),
+    ):
+        cur = row.get(col, "")
+        if (not cur or (prev_val and cur == prev_val)) and cur != new_val:
+            row[col] = new_val
+            changed = True
+    return changed
+
+
+# ---------------- bulk apply (Pricing tab) ----------------
+def build_pricing_plan(df: pd.DataFrame, overwrite: bool = False) -> pd.DataFrame:
+    """One row per stone: what the price list says, what is stored, and what would happen."""
+    tables = get_price_tables()
+    rows = []
+    for rec in df.to_dict("records"):
+        res = derive_pricing(rec, tables)
+        cur_code, cur_price = _s(rec.get("FGI Item Number")), _s(rec.get("Price Per Carat"))
+        new_price = format_price(res.price) if res.price is not None else ""
+        if not res.code:
+            action, why = "Review", res.reason
+        else:
+            code_ok, price_ok = cur_code == res.code, _parse_money(cur_price) == (res.price or 0) and bool(cur_price)
+            need_code = not cur_code or (overwrite and not code_ok)
+            need_price = not cur_price or (overwrite and not price_ok)
+            if need_code or need_price:
+                action, why = "Fill" if not overwrite else "Fill / update", ""
+            elif code_ok and price_ok:
+                action, why = "Up to date", ""
+            else:
+                action, why = "Kept (typed value differs)", ""
+        rows.append({
+            "Certificate Number": _s(rec.get("Certificate Number")), "Lab": _s(rec.get("Lab")),
+            "SHAPE AND CUT": _s(rec.get("SHAPE AND CUT")), "CARAT WEIGHT": _s(rec.get("CARAT WEIGHT")),
+            "Grade": "/".join(x for x in (_s(rec.get("COLOR GRADE")), _s(rec.get("CLARITY GRADE"))) if x),
+            "Proposed code": res.code, "Proposed $/ct": new_price,
+            "Current code": cur_code, "Current $/ct": cur_price,
+            "Action": action, "Why": why,
+        })
+    return pd.DataFrame(rows)
+
+
+def plan_to_changes(plan: pd.DataFrame, overwrite: bool = False) -> Changes:
+    changes: Changes = {}
+    for r in plan.to_dict("records"):
+        if r["Action"] not in ("Fill", "Fill / update"):
+            continue
+        for col, cur, new in (("FGI Item Number", r["Current code"], r["Proposed code"]),
+                              ("Price Per Carat", r["Current $/ct"], r["Proposed $/ct"])):
+            if new and cur != new and (not cur or overwrite):
+                changes.setdefault(r["Certificate Number"], {})[col] = (cur, new)
+    return changes
+
+
+# -------------------------------------------------
 # Batch lookup (runs in worker threads – no Streamlit calls in here)
 # -------------------------------------------------
 def fetch_item(item_type: str, value: str) -> Dict[str, Any]:
@@ -2495,11 +2827,12 @@ with st.sidebar:
     st.metric("Added today", count_added_today(_stats_df))
     st.caption("Storage: Google Sheets" if use_gsheets() else "Storage: local SQLite (not shared)")
 
-tab_add, tab_all, tab_edit, tab_video = st.tabs([
+tab_add, tab_all, tab_edit, tab_video, tab_price = st.tabs([
     "Add certificates",
     "Inventory",
     "Edit records",
     "Media links",
+    "Pricing codes",
 ])
 
 # =========================================================
@@ -2846,5 +3179,85 @@ with tab_video:
             report_upsert(upsert_res)
             if results:
                 st.dataframe(pd.DataFrame(results), hide_index=True, **_STRETCH)
+
+# =========================================================
+# TAB 5 – Item codes & standard prices from the price list
+# =========================================================
+with tab_price:
+    _pflash = st.session_state.pop("pricing_flash", None)
+    if _pflash:
+        getattr(st, _pflash[0])(_pflash[1])
+
+    _tables = get_price_tables()
+    if not _tables:
+        st.warning(
+            f"Price list not found. Put '{PRICE_LIST_FILENAME}' next to the app, or set "
+            "[pricing] file = \"path\" in secrets."
+        )
+    else:
+        _eff = _tables.get("effective", {})
+        st.caption(
+            f"{_tables['source']} · LCD effective {_eff.get('LCD', '?')} · GIA effective {_eff.get('GIA', '?')} "
+            f"· IGI lab-grown uses the {LCD_QUALITY_SUFFIX} tier · Standard prices"
+        )
+        st.caption(
+            "New and re-fetched stones are filled automatically on save. Use this tab to fill stones "
+            "that were saved earlier, or to see which stones the price list cannot cover."
+        )
+        _dfp = load_all_inventory()
+        if _dfp.empty:
+            st.info("No inventory records yet.")
+        else:
+            _over = st.checkbox(
+                "Also update existing codes / prices that differ from the price list", value=False, key="pricing_overwrite",
+                help="Off: only blank cells are filled and anything typed by hand is kept. "
+                     "On: use after a new price list to re-price everything.",
+            )
+            _plan = build_pricing_plan(_dfp, overwrite=_over)
+            _n = _plan["Action"].value_counts()
+            _fill = int(_n.get("Fill", 0) + _n.get("Fill / update", 0))
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("To fill", _fill)
+            m2.metric("Up to date", int(_n.get("Up to date", 0)))
+            m3.metric("Kept (typed)", int(_n.get("Kept (typed value differs)", 0)))
+            m4.metric("Needs review", int(_n.get("Review", 0)))
+
+            _show = st.selectbox("Show", ["To fill", "Needs review", "Up to date", "All"], key="pricing_show")
+            _mask = {
+                "To fill": _plan["Action"].isin(["Fill", "Fill / update"]),
+                "Needs review": _plan["Action"] == "Review",
+                "Up to date": _plan["Action"] == "Up to date",
+                "All": pd.Series(True, index=_plan.index),
+            }[_show]
+            _view_p = _plan[_mask]
+            if _view_p.empty:
+                st.info("Nothing to show here.")
+            else:
+                st.dataframe(_view_p, hide_index=True, height=420, **_STRETCH)
+
+            a1, a2 = st.columns(2)
+            with a1:
+                if st.button(f"Apply to {_fill} stone(s)", type="primary", disabled=_fill == 0, key="pricing_apply", **_STRETCH):
+                    try:
+                        _res = update_editable_fields(plan_to_changes(_plan, overwrite=_over))
+                    except Exception as e:
+                        logger.exception("Pricing apply failed")
+                        st.error(f"Could not apply: {str(e)[:300]}")
+                    else:
+                        _msg = f"Updated {_res['updated']} cell(s)."
+                        if _res["conflicts"]:
+                            st.session_state["pricing_flash"] = (
+                                "warning", f"{_msg} Skipped {len(_res['conflicts'])} cell(s) changed by someone else meanwhile.")
+                        else:
+                            st.session_state["pricing_flash"] = ("success", _msg)
+                        st.rerun()
+            with a2:
+                _review = _plan[_plan["Action"] == "Review"]
+                if not _review.empty:
+                    st.download_button(
+                        "Download review list", data=df_to_xlsx_bytes(_review, "Needs review"),
+                        file_name=f"Pricing_review_{date.today().isoformat()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", **_STRETCH,
+                    )
 
 st.caption("Certified Stone Inventory · FGI")
