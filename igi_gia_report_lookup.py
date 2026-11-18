@@ -2471,10 +2471,20 @@ def suggest_terms(df: pd.DataFrame, pq: ParsedQuery) -> List[str]:
 # Auto-filled values never overwrite something typed by hand (see _autofill_pricing).
 # -------------------------------------------------
 PRICE_LIST_FILENAME = "Price_List_and_Code.xlsx"
+ITEM_MASTER_FILENAME = "GIA_Item_Master.tsv"   # ERP item list (tab/comma separated) with extra GIA tiers such as DRX
 GIA_REQUIRE_NO_FLUORESCENCE = True      # the GIA sheet is headed "No fluorescence"
 LCD_QUALITY_SUFFIX = "5L"               # certificate-stone tier of the LCD sheets
+ENFORCE_LCD_GRADE_WINDOW = True         # IGI stones must sit inside the 5L grade window (see below)
+
+# "One level better still uses the tier": a stone at, or better than, a tier's benchmark colour and
+# clarity uses that tier's code and price, up to one clarity GROUP better (SI->VS, VS->VVS).
+CLARITY_GROUPS_BETTER_ALLOWED = 1
+COLOUR_STEPS_BETTER_ALLOWED: Optional[int] = None    # None = any colour better than the benchmark (D..benchmark)
 
 _GIA_CLARITY_ORDER = ["FL", "IF", "VVS1", "VVS2", "VS1", "VS2", "SI1", "SI2", "SI3", "I1", "I2", "I3"]
+_CUT_RANK = {"POOR": 0, "FAIR": 1, "GOOD": 2, "VERY GOOD": 3, "EXCELLENT": 4, "IDEAL": 4}
+_CUT_NAME = {0: "Poor", 1: "Fair", 2: "Good", 3: "Very Good", 4: "Excellent"}
+_GROUP_BEST = {0: "I1", 1: "SI1", 2: "VS1", 3: "VVS1", 4: "FL"}
 
 _SHEET_SHAPE_KEYS = [                   # sheet heading text -> canonical shape key
     ("ELONGATED", "ELONGATED_CUSHION"), ("ROUND", "ROUND"), ("OVAL", "OVAL"), ("EMERALD", "EMERALD"),
@@ -2546,6 +2556,8 @@ def _parse_lcd_sheet(ws, out: Dict[str, Any]) -> None:
     shape_row = _find_row(ws, 3, lambda v: v == "SHAPE")
     code_row = _find_row(ws, 3, lambda v: v == "QUALITY CODE")
     head_row = _find_row(ws, 1, lambda v: "SIZE RANGE" in v)
+    grade_row = _find_row(ws, 3, lambda v: v.startswith("GIA GRADE"))
+    cut_row = _find_row(ws, 3, lambda v: v.startswith("CUT GRADE"))
     if not (shape_row and code_row and head_row):
         return
     starts = [(c, ws.cell(shape_row, c).value) for c in range(4, ws.max_column + 1) if ws.cell(shape_row, c).value]
@@ -2554,7 +2566,14 @@ def _parse_lcd_sheet(ws, out: Dict[str, Any]) -> None:
         if not code.upper().endswith(LCD_QUALITY_SUFFIX):
             continue
         shape = _sheet_shape_key(_group_start(starts, c))
-        out["lcd"][shape] = {"quality": code, "bands": _read_bands(ws, head_row, c)}   # code column = "Standard"
+        tier = {"quality": code, "bands": _read_bands(ws, head_row, c)}          # code column = "Standard"
+        gm = re.search(r"\b([D-Z])\s*-\s*(FL|IF|VVS[12]|VS[12]|SI[123]|I[123])\b",
+                       str(ws.cell(grade_row, c).value or "").upper()) if grade_row else None
+        if gm:                                                                   # e.g. "F-VS2 (Certified)"
+            tier["max_color"], tier["min_clarity"] = gm.group(1), gm.group(2)
+        if cut_row:
+            tier["min_cut"] = _cut_floor(ws.cell(cut_row, c).value)
+        out["lcd"][shape] = tier
 
 
 def _parse_gia_sheet(ws, out: Dict[str, Any]) -> None:
@@ -2562,6 +2581,7 @@ def _parse_gia_sheet(ws, out: Dict[str, Any]) -> None:
     code_row = _find_row(ws, 3, lambda v: v == "QUALITY CODE")
     color_row = _find_row(ws, 3, lambda v: v.startswith("COLOR"))
     clar_row = _find_row(ws, 3, lambda v: v.startswith("CLARITY"))
+    cut_row = _find_row(ws, 3, lambda v: v.startswith("CUT"))
     head_row = _find_row(ws, 1, lambda v: "SIZE RANGE" in v)
     if not all([shape_row, code_row, color_row, clar_row, head_row]):
         return
@@ -2578,15 +2598,81 @@ def _parse_gia_sheet(ws, out: Dict[str, Any]) -> None:
             continue
         shape = _sheet_shape_key(_group_start(starts, c))
         tiers = out["gia"].setdefault(shape, {})
-        tier = tiers.setdefault(prefix, {"prefix": prefix, "max_color": color, "min_clarity": clarity, "variants": {}})
+        tier = tiers.setdefault(prefix, {"prefix": prefix, "max_color": color, "min_clarity": clarity,
+                                         "min_cut": 3, "variants": {}, "source": "price list"})
+        if variant == "" and cut_row:                       # the "3X" column's cut cell is a marker, not a grade
+            tier["min_cut"] = _cut_floor(ws.cell(cut_row, c).value) or tier["min_cut"]
         tier["variants"][variant] = _read_bands(ws, head_row, c)
 
 
-@st.cache_resource(show_spinner=False)       # same object every call (no per-row copying); keyed on file mtime
-def _load_price_tables(path: str, mtime: float) -> Dict[str, Any]:
+def _item_master_path() -> str:
+    try:
+        custom = st.secrets.get("pricing", {}).get("item_master_file")
+    except Exception:
+        custom = None
+    return str(custom) if custom else os.path.join(os.path.dirname(os.path.abspath(__file__)), ITEM_MASTER_FILENAME)
+
+
+def _parse_item_master(path: str, out: Dict[str, Any]) -> int:
+    """
+    Read GIA tiers from the ERP item list (tab- or comma-separated). Each row is one item, e.g.
+    DRX002000G: shape, benchmark colour/clarity, cut range, min/max weight, unit cost ($/ct).
+    Tiers whose prefix already exists in the price-list sheet are skipped (the sheet wins).
+    """
+    import csv
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        first = f.readline()
+        f.seek(0)
+        rows = list(csv.reader(f, delimiter="\t" if "\t" in first else ","))
+    if not rows:
+        return 0
+    norm = lambda h: re.sub(r"[^a-z0-9]", "", str(h).lower())
+    head = [norm(h) for h in rows[0]]
+    need = ["itemno", "shapecutstyle", "colorgrade", "claritygrade", "cut", "minweight", "maxweight", "unitcost"]
+    if any(n not in head for n in need):
+        logger.warning("Item master %s is missing columns: %s", path, [n for n in need if n not in head])
+        return 0
+    ix = {n: head.index(n) for n in need}
+    nat = head.index("naturalcreated") if "naturalcreated" in head else None
+    count = 0
+    for r in rows[1:]:
+        if len(r) <= max(ix.values()):
+            continue
+        item = r[ix["itemno"]].strip().upper()
+        if nat is not None and not r[nat].strip().upper().startswith("NAT"):
+            continue                                        # only mined stones belong to the GIA tiers
+        colour = r[ix["colorgrade"]].strip().upper()[:1]
+        clarity = r[ix["claritygrade"]].strip().upper().replace(" ", "")
+        try:
+            lo, hi = float(r[ix["minweight"]]), float(r[ix["maxweight"]])
+            price = float(str(r[ix["unitcost"]]).replace(",", "").replace("$", ""))
+        except ValueError:
+            continue
+        if len(item) < 4 or not colour or clarity not in _GIA_CLARITY_ORDER:
+            continue
+        shape, prefix, rollup = _sheet_shape_key(r[ix["shapecutstyle"]]), item[:3], item[3:]
+        tiers = out["gia"].setdefault(shape, {})
+        tier = tiers.get(prefix)
+        if tier is not None and tier.get("source") == "price list":
+            continue
+        if tier is None:
+            tier = tiers[prefix] = {"prefix": prefix, "max_color": colour, "min_clarity": clarity,
+                                    "min_cut": _cut_floor(r[ix["cut"]]) or 3, "variants": {"": []},
+                                    "source": "item master"}
+        tier["variants"][""].append((lo, hi, rollup, price))
+        count += 1
+    for tiers in out["gia"].values():
+        for t in tiers.values():
+            if t.get("source") == "item master":
+                t["variants"][""].sort(key=lambda b: b[0])
+    return count
+
+
+@st.cache_resource(show_spinner=False)       # same object every call (no per-row copying); keyed on file mtimes
+def _load_price_tables(path: str, mtime: float, master_path: str, master_mtime: float) -> Dict[str, Any]:
     import openpyxl
     wb = openpyxl.load_workbook(path, data_only=True)
-    out: Dict[str, Any] = {"lcd": {}, "gia": {}, "effective": {}, "source": os.path.basename(path)}
+    out: Dict[str, Any] = {"lcd": {}, "gia": {}, "effective": {}, "source": os.path.basename(path), "item_master": None}
     for ws in wb.worksheets:
         head = f"{ws['A1'].value or ''} {ws['A2'].value or ''}".upper()
         m = re.search(r"EFFECTIVE\s+([\d./-]+)", head)
@@ -2599,15 +2685,24 @@ def _load_price_tables(path: str, mtime: float) -> Dict[str, Any]:
             _parse_lcd_sheet(ws, out)
             if m:
                 out["effective"].setdefault("LCD", m.group(1))
+    if master_mtime:
+        try:
+            n = _parse_item_master(master_path, out)
+            out["item_master"] = {"file": os.path.basename(master_path), "items": n}
+        except Exception:
+            logger.exception("Could not read item master %s", master_path)
     return out
 
 
 def get_price_tables() -> Optional[Dict[str, Any]]:
-    path = _price_list_path()
+    path, mpath = _price_list_path(), _item_master_path()
     try:
-        return _load_price_tables(path, os.path.getmtime(path))
+        mtime = os.path.getmtime(path)
     except FileNotFoundError:
         return None
+    try:
+        mmtime = os.path.getmtime(mpath) if os.path.exists(mpath) else 0.0
+        return _load_price_tables(path, mtime, mpath, mmtime)
     except Exception:
         logger.exception("Could not read price list %s", path)
         return None
@@ -2631,6 +2726,57 @@ def stone_shape_key(shape_text: str) -> str:
         if re.search(SHAPE_DEFS[key][0], t):
             return key
     return ""
+
+
+def _clarity_group(c: str) -> int:
+    if c in ("FL", "IF"):
+        return 4
+    if c.startswith("VVS"):
+        return 3
+    if c.startswith("VS"):
+        return 2
+    if c.startswith("SI"):
+        return 1
+    return 0
+
+
+def _cut_floor(text: Any) -> Optional[int]:
+    """Lowest grade named in a sheet cell: 'Very Good' -> 3, 'Good to very good' -> 2, 'Excellent' -> 4."""
+    found = re.findall(r"VERY GOOD|GOOD|EXCELLENT|IDEAL|FAIR|POOR", str(text or "").upper())
+    return min(_CUT_RANK[f] for f in found) if found else None
+
+
+def _effective_cut_rank(cut: str, pol: str, sym: str) -> Optional[int]:
+    """Cut grade rank; shapes without a cut grade use the lower of polish and symmetry."""
+    if cut in _CUT_RANK:
+        return _CUT_RANK[cut]
+    if cut == "" and pol in _CUT_RANK and sym in _CUT_RANK:
+        return min(_CUT_RANK[pol], _CUT_RANK[sym])
+    return None
+
+
+def _in_window(colour: str, clarity: str, cut_rank: Optional[int], tier: Dict[str, Any]) -> bool:
+    bench_c, bench_clar = tier.get("max_color"), tier.get("min_clarity")
+    if not bench_c or not bench_clar:
+        return True
+    if colour > bench_c:
+        return False
+    if COLOUR_STEPS_BETTER_ALLOWED is not None and ord(bench_c) - ord(colour) > COLOUR_STEPS_BETTER_ALLOWED:
+        return False
+    if _GIA_CLARITY_ORDER.index(clarity) > _GIA_CLARITY_ORDER.index(bench_clar):
+        return False
+    if _clarity_group(clarity) > _clarity_group(bench_clar) + CLARITY_GROUPS_BETTER_ALLOWED:
+        return False
+    need = tier.get("min_cut")
+    return need is None or (cut_rank is not None and cut_rank >= need)
+
+
+def _describe_window(tier: Dict[str, Any]) -> str:
+    bench_c, bench_clar = tier.get("max_color", "?"), tier.get("min_clarity", "?")
+    top = _GROUP_BEST.get(min(_clarity_group(bench_clar) + CLARITY_GROUPS_BETTER_ALLOWED, 4), "?")
+    low_c = "D" if COLOUR_STEPS_BETTER_ALLOWED is None else chr(max(ord("D"), ord(bench_c) - COLOUR_STEPS_BETTER_ALLOWED))
+    cut = _CUT_NAME.get(tier.get("min_cut"), "any")
+    return f"{tier.get('prefix') or tier.get('quality')}: colour {low_c}–{bench_c}, clarity {bench_clar} to {top}, cut {cut}+"
 
 
 def _find_band(bands, carat: float):
@@ -2670,6 +2816,19 @@ def derive_pricing(row: Dict[str, Any], tables: Optional[Dict[str, Any]] = None)
         return PricingResult(reason=f"Cushion style unclear ({g('SHAPE AND CUT')}): needs 'Square Cushion' "
                                     "or 'Cushion Modified Brilliant' to choose LU5L vs LEU5L")
 
+    colour, clarity = g("COLOR GRADE").upper(), g("CLARITY GRADE").upper().replace(" ", "")
+    cut, pol, sym = g("CUT").upper(), g("POLISH").upper(), g("SYMMETRY").upper()
+    cut_rank = _effective_cut_rank(cut, pol, sym)
+
+    def grades_usable() -> str:
+        if not re.fullmatch(r"[D-Z]", colour):
+            return f"Colour '{colour or 'blank'}' is not a D–Z grade"
+        if clarity not in _GIA_CLARITY_ORDER:
+            return f"Clarity '{clarity or 'blank'}' not recognised"
+        if cut_rank is None:
+            return "Cut grade missing (no cut grade, or no polish/symmetry to use instead)"
+        return ""
+
     # ---------------- IGI lab-grown  ->  LCD sheets, 5L tier ----------------
     if lab == "IGI":
         if not lab_grown:
@@ -2677,6 +2836,13 @@ def derive_pricing(row: Dict[str, Any], tables: Optional[Dict[str, Any]] = None)
         tier = tables["lcd"].get(shape)
         if not tier:
             return PricingResult(reason=f"No {LCD_QUALITY_SUFFIX} price for {shape.replace('_', ' ').title()}")
+        if ENFORCE_LCD_GRADE_WINDOW and tier.get("max_color") and tier.get("min_clarity"):
+            bad = grades_usable()
+            if bad:
+                return PricingResult(reason=bad)
+            if not _in_window(colour, clarity, cut_rank, tier):
+                return PricingResult(reason=f"{colour}-{clarity} / {_CUT_NAME[cut_rank]} cut is outside "
+                                            f"{_describe_window(tier)}")
         band = _find_band(tier["bands"], carat)
         if not band:
             return PricingResult(reason=f"{carat:g} ct is outside the listed sizes")
@@ -2684,43 +2850,33 @@ def derive_pricing(row: Dict[str, Any], tables: Optional[Dict[str, Any]] = None)
             return PricingResult(reason=f"No {tier['quality']} price for {band[0]:g}–{band[1]:g} ct")
         return PricingResult(code=f"{tier['quality']}{band[2]}", price=band[3], tier=tier["quality"])
 
-    # ---------------- GIA mined  ->  GIA Cert sheet ----------------
+    # ---------------- GIA mined  ->  GIA Cert sheet + item master tiers ----------------
     if lab == "GIA":
         if lab_grown:
             return PricingResult(reason="GIA lab-grown stones are not in the mined price list")
         tiers = tables["gia"].get(shape)
         if not tiers:
             return PricingResult(reason=f"No GIA price list for {shape.replace('_', ' ').title()}")
-        colour, clarity = g("COLOR GRADE").upper(), g("CLARITY GRADE").upper().replace(" ", "")
-        if not re.fullmatch(r"[D-Z]", colour):
-            return PricingResult(reason=f"Colour '{colour or 'blank'}' is not a D–Z grade")
-        if clarity not in _GIA_CLARITY_ORDER:
-            return PricingResult(reason=f"Clarity '{clarity or 'blank'}' not recognised")
+        bad = grades_usable()
+        if bad:
+            return PricingResult(reason=bad)
         fluo = g("FLUORESCENCE").upper()
         if GIA_REQUIRE_NO_FLUORESCENCE and fluo and fluo != "NONE":
             return PricingResult(reason=f"Fluorescence {fluo.title()} (price list is for none)")
 
-        ordered = sorted(tiers.values(),
-                         key=lambda t: (t["max_color"], _GIA_CLARITY_ORDER.index(t["min_clarity"])))
-        tier = next((t for t in ordered
-                     if colour <= t["max_color"]
-                     and _GIA_CLARITY_ORDER.index(clarity) <= _GIA_CLARITY_ORDER.index(t["min_clarity"])), None)
+        # strictest clarity floor first (DRK, DRY before DRX), then colour
+        ordered = sorted(tiers.values(), key=lambda t: (_GIA_CLARITY_ORDER.index(t["min_clarity"]), t["max_color"]))
+        tier = next((t for t in ordered if _in_window(colour, clarity, cut_rank, t)), None)
         if tier is None:
-            worst = ordered[-1]
-            return PricingResult(reason=f"{colour}-{clarity} is below the listed grades "
-                                        f"(needs {worst['max_color']} or better, {worst['min_clarity']} or better)")
+            return PricingResult(reason=f"{colour}-{clarity} / {_CUT_NAME[cut_rank]} cut is outside the listed tiers: "
+                                        + "; ".join(_describe_window(t) for t in ordered))
 
-        cut, pol, sym = g("CUT").upper(), g("POLISH").upper(), g("SYMMETRY").upper()
-        good = {"EXCELLENT", "VERY GOOD", "IDEAL"}
-        cut_ok = cut in good or (cut == "" and pol in good and sym in good)   # fancy shapes carry no cut grade
-        if not cut_ok:
-            return PricingResult(reason=f"Cut below Very Good ({cut.title() or 'no cut grade'})")
         is_3x = pol == "EXCELLENT" and sym == "EXCELLENT" and cut in ("EXCELLENT", "IDEAL", "")
         variant = "3X" if is_3x and "3X" in tier["variants"] else ""
         bands = tier["variants"].get(variant) or tier["variants"].get("")
         band = _find_band(bands or [], carat)
         if not band:
-            return PricingResult(reason=f"{carat:g} ct is outside the listed GIA sizes")
+            return PricingResult(reason=f"{carat:g} ct is outside the listed {tier['prefix']} sizes")
         if band[3] is None:
             return PricingResult(reason=f"No GIA price for {band[0]:g}–{band[1]:g} ct")
         return PricingResult(code=f"{tier['prefix']}{band[2]}{variant}", price=band[3], tier=tier["prefix"])
@@ -3207,9 +3363,11 @@ with tab_price:
         )
     else:
         _eff = _tables.get("effective", {})
+        _im = _tables.get("item_master")
         st.caption(
             f"{_tables['source']} · LCD effective {_eff.get('LCD', '?')} · GIA effective {_eff.get('GIA', '?')} "
             f"· IGI lab-grown uses the {LCD_QUALITY_SUFFIX} tier · Standard prices"
+            + (f" · {_im['file']}: {_im['items']} GIA items" if _im else f" · {ITEM_MASTER_FILENAME} not found")
         )
         st.caption(
             "New and re-fetched stones are filled automatically on save. Use this tab to fill stones "
