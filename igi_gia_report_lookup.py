@@ -2617,7 +2617,15 @@ def stone_shape_key(shape_text: str) -> str:
     t = str(shape_text or "").upper()
     if not t:
         return ""
-    if "ELONGATED" in t or "RECTANGULAR CUSHION" in t:
+    if "CUSHION" in t:
+        # Lab naming: "Square Cushion Modified Brilliant" = Cushion (LU5L);
+        #             "Cushion Modified Brilliant" / rectangular / elongated = Elongated Cushion (LEU5L).
+        if "SQUARE CUSHION" in t:
+            return "CUSHION"
+        if "CUSHION MODIFIED" in t or "ELONGATED" in t:
+            return "ELONGATED_CUSHION"
+        return "CUSHION_UNCLEAR"          # e.g. plain "Cushion Brilliant": don't guess between the two
+    if "ELONGATED" in t:
         return "ELONGATED_CUSHION"
     for key in _STONE_SHAPE_ORDER:
         if re.search(SHAPE_DEFS[key][0], t):
@@ -2658,6 +2666,9 @@ def derive_pricing(row: Dict[str, Any], tables: Optional[Dict[str, Any]] = None)
         return PricingResult(reason="No carat weight")
     if not shape:
         return PricingResult(reason=f"Shape not recognised ({g('SHAPE AND CUT') or 'blank'})")
+    if shape == "CUSHION_UNCLEAR":
+        return PricingResult(reason=f"Cushion style unclear ({g('SHAPE AND CUT')}): needs 'Square Cushion' "
+                                    "or 'Cushion Modified Brilliant' to choose LU5L vs LEU5L")
 
     # ---------------- IGI lab-grown  ->  LCD sheets, 5L tier ----------------
     if lab == "IGI":
