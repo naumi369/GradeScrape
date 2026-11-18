@@ -2023,7 +2023,7 @@ SHAPE_DEFS: Dict[str, Tuple[str, set]] = {
     "CUSHION": (r"CUSHION", {"CUSHION", "CU", "CUS", "CB"}),
     "EMERALD": (r"(?<!SQUARE )EMERALD", {"EMERALD", "EM", "EMD"}),
     "ASSCHER": (r"ASSCHER|SQUARE EMERALD", {"ASSCHER", "AS", "ASH"}),
-    "RADIANT": (r"RADIANT|CUT[ -]CORNERED (?:RECTANGULAR|SQUARE) MODIFIED BRILLIANT", {"RADIANT", "RAD"}),
+    "RADIANT": (r"RADIANT|CUT[ -]CORNERED (?:RECTANGULAR|SQUARE)(?! STEP)", {"RADIANT", "RAD"}),
     "HEART": (r"HEART", {"HEART", "HS", "HT"}),
     "TRIANGLE": (r"TRILLIANT|TRILLION|TRIANGL|TRIANGUL", {"TRILLIANT", "TRILLION", "TRIANGLE", "TR"}),
     "BAGUETTE": (r"BAGUETTE", {"BAGUETTE", "BAG"}),
@@ -2577,6 +2577,8 @@ def _parse_lcd_sheet(ws, out: Dict[str, Any]) -> None:
 
 
 def _parse_gia_sheet(ws, out: Dict[str, Any]) -> None:
+    # heading such as "GIA certified, very good cut or better, No fluroscence" (sic) applies to this sheet's tiers
+    no_fluor = bool(re.search(r"NO\s+FLU", f"{ws['A1'].value or ''} {ws['A2'].value or ''}".upper()))
     shape_row = _find_row(ws, 3, lambda v: v == "SHAPE")
     code_row = _find_row(ws, 3, lambda v: v == "QUALITY CODE")
     color_row = _find_row(ws, 3, lambda v: v.startswith("COLOR"))
@@ -2599,7 +2601,8 @@ def _parse_gia_sheet(ws, out: Dict[str, Any]) -> None:
         shape = _sheet_shape_key(_group_start(starts, c))
         tiers = out["gia"].setdefault(shape, {})
         tier = tiers.setdefault(prefix, {"prefix": prefix, "max_color": color, "min_clarity": clarity,
-                                         "min_cut": 3, "variants": {}, "source": "price list"})
+                                         "min_cut": 3, "variants": {}, "source": "price list",
+                                         "no_fluorescence": no_fluor})
         if variant == "" and cut_row:                       # the "3X" column's cut cell is a marker, not a grade
             tier["min_cut"] = _cut_floor(ws.cell(cut_row, c).value) or tier["min_cut"]
         tier["variants"][variant] = _read_bands(ws, head_row, c)
@@ -2658,7 +2661,7 @@ def _parse_item_master(path: str, out: Dict[str, Any]) -> int:
         if tier is None:
             tier = tiers[prefix] = {"prefix": prefix, "max_color": colour, "min_clarity": clarity,
                                     "min_cut": _cut_floor(r[ix["cut"]]) or 3, "variants": {"": []},
-                                    "source": "item master"}
+                                    "source": "item master", "no_fluorescence": False}
         tier["variants"][""].append((lo, hi, rollup, price))
         count += 1
     for tiers in out["gia"].values():
@@ -2861,13 +2864,17 @@ def derive_pricing(row: Dict[str, Any], tables: Optional[Dict[str, Any]] = None)
         if bad:
             return PricingResult(reason=bad)
         fluo = g("FLUORESCENCE").upper()
-        if GIA_REQUIRE_NO_FLUORESCENCE and fluo and fluo != "NONE":
-            return PricingResult(reason=f"Fluorescence {fluo.title()} (price list is for none)")
+        has_fluo = GIA_REQUIRE_NO_FLUORESCENCE and fluo not in ("", "NONE")
+        usable = lambda t: not (has_fluo and t.get("no_fluorescence"))     # DRK/DRY are priced for "no fluorescence"
 
         # strictest clarity floor first (DRK, DRY before DRX), then colour
         ordered = sorted(tiers.values(), key=lambda t: (_GIA_CLARITY_ORDER.index(t["min_clarity"]), t["max_color"]))
-        tier = next((t for t in ordered if _in_window(colour, clarity, cut_rank, t)), None)
+        tier = next((t for t in ordered if usable(t) and _in_window(colour, clarity, cut_rank, t)), None)
         if tier is None:
+            blocked = [t["prefix"] for t in ordered if not usable(t) and _in_window(colour, clarity, cut_rank, t)]
+            if blocked:
+                return PricingResult(reason=f"Fluorescence {fluo.title()}: {', '.join(blocked)} are priced for no "
+                                            "fluorescence and no other tier fits")
             return PricingResult(reason=f"{colour}-{clarity} / {_CUT_NAME[cut_rank]} cut is outside the listed tiers: "
                                         + "; ".join(_describe_window(t) for t in ordered))
 
